@@ -14,21 +14,24 @@ int cpu_threads = 4;
 // ------------------------------------------------------------
 //  ОСНОВНЫЕ КОНСТАНТЫ
 // ------------------------------------------------------------
-#define SW 1280         // Ширина рендера
-#define SH 720          // Высота рендера
-#define MW 192          // Ширина карты
-#define MH 192          // Высота карты
-#define TS 32           // Размер текстуры
+
+#define MAX_PITCH 1.0f  
+#define SW 1080
+#define SH 720
+#define MW 192
+#define MH 192
+#define TS 32
 #define SKY_W 4024
 #define SKY_H 1072
 
 // Высоты (Потолки подняты, чтобы не застревать на ящиках)
+
 #define Z_FLOOR      0.0f
 #define Z_STEP       0.125f
-#define Z_CRATE      2.5f  // Высота ящика (чтобы запрыгивать)
+#define Z_CRATE      2.5f
 #define Z_CEIL       2.5f
 #define Z_LOWCEIL    2.5f
-#define Z_HIGHCEIL   2.5f   // Высокий потолок
+#define Z_HIGHCEIL   2.5f
 
 // Игрок
 #define PLAYER_RADIUS 0.4f
@@ -48,22 +51,22 @@ int cpu_threads = 4;
 // ------------------------------------------------------------
 //  ТИПЫ КЛЕТОК И СТРУКТУРЫ
 // ------------------------------------------------------------
+
 typedef enum {
-	CELL_EMPTY = 0,     // Пусто (пол/потолок)
-	CELL_WALL,          // Обычная стена
-	CELL_DOOR,          // Дверь
-	CELL_WINDOW,        // Окно
-	CELL_CRATE,         // Ящик
-	CELL_LOW_WALL       // Низкая стена
+	CELL_EMPTY = 0,
+	CELL_WALL,
+	CELL_DOOR,
+	CELL_CRATE,
+	CELL_LOW_WALL
 } CellType;
 
 typedef struct {
-	uint8_t  type;      // CellType
-	uint8_t  wallTex;   // Индекс текстуры стены
-	uint8_t  floorTex;  // Индекс текстуры пола
-	uint8_t  ceilTex;   // Индекс текстуры потолка
-	float    floorZ;    // Высота пола
-	float    ceilZ;     // Высота потолка
+	uint8_t  type;
+	uint8_t  wallTex;
+	uint8_t  floorTex;
+	uint8_t  ceilTex;
+	float    floorZ;
+	float    ceilZ;
 } Cell;
 
 // --- ОРУЖИЕ И ГИЛЬЗЫ ---
@@ -71,9 +74,9 @@ typedef struct {
 #define MAX_BULLETS 1000
 
 typedef struct {
-	float x, y, z;      // Позиция в мире (на стене)
-	float normalX, normalY; // Нормаль (куда смотрит стена)
-	int texID;          // Какая текстура была (не обязательно, но можно)
+	float x, y, z;
+	float normalX, normalY;
+	int texID;
 	bool active;
 } BulletHole;
 
@@ -122,20 +125,18 @@ typedef struct {
 	float pa, pitch;
 	bool  onGround;
 	float bobPhase, bobAmount;
-	float stamina;      // <--- ДОБАВИТЬ
-	float maxStamina;   // <--- ДОБАВИТЬ
-
-	float aimSpreadX;  // <--- ДОБАВИТЬ
-	float aimSpreadY;  // <--- ДОБАВИТЬ
-
-	float crosshairX; // Смещение прицела по X (0 = центр экрана)
-	float crosshairY; // Смещение прицела по Y (0 = центр экрана)
-	
+	float stamina;
+	float maxStamina;
+	float aimSpreadX;
+	float aimSpreadY;
+	float crosshairX;
+	float crosshairY;	
 } Player;
 
 // ------------------------------------------------------------
 //  ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
 // ------------------------------------------------------------
+
 Cell map[MW][MH];
 Player player;
 
@@ -169,7 +170,7 @@ Color ceilTex[N_CEIL_TEX][TS][TS];
 Color skyTex[SKY_H][SKY_W];
 
 // ------------------------------------------------------------
-//  СЕКТОР 2: МАТЕМАТИКА ДЛЯ ТЕКСТУР (Из Dust2)
+//  СЕКТОР 2: МАТЕМАТИКА ДЛЯ ТЕКСТУР
 // ------------------------------------------------------------
 
 // Хеш-функция для псевдослучайных чисел без внешнего состояния
@@ -220,7 +221,7 @@ static inline Color MixColor(Color a, Color b, float t) {
 }
 
 // ------------------------------------------------------------
-//  СЕКТОР 3: ТЕКСТУРЫ СТЕН (Из Dust2) - Часть 1
+//  СЕКТОР 3: ТЕКСТУРЫ СТЕН
 // ------------------------------------------------------------
 
 // Текстура 0: Песочный кирпич
@@ -326,7 +327,7 @@ static void GenerateWall_Stone(Color tex[TS][TS]) {
 }
 
 // ------------------------------------------------------------
-//  СЕКТОР 4: ТЕКСТУРЫ СТЕН (Из Dust2) - Часть 2
+//  СЕКТОР 4: ТЕКСТУРЫ СТЕН
 // ------------------------------------------------------------
 
 // Текстура 3: Деревянный ящик
@@ -477,7 +478,7 @@ static void GenerateWall_BrickMarked(Color tex[TS][TS]) {
 }
 
 // ------------------------------------------------------------
-//  СЕКТОР 5: ТЕКСТУРЫ ПОЛОВ (Из Dust2) - Часть 1
+//  СЕКТОР 5: ТЕКСТУРЫ ПОЛОВ
 // ------------------------------------------------------------
 
 // Пол 0: Песок (улицы)
@@ -580,7 +581,7 @@ static void GenerateFloor_Gravel(Color tex[TS][TS]) {
 }
 
 // ------------------------------------------------------------
-//  СЕКТОР 6: ТЕКСТУРЫ ПОЛОВ (Из Dust2) - Часть 2
+//  СЕКТОР 6: ТЕКСТУРЫ ПОЛОВ
 // ------------------------------------------------------------
 
 // Пол 4: Деревянный пол (внутри зданий)
@@ -608,7 +609,7 @@ static void GenerateFloor_Wood(Color tex[TS][TS]) {
 	}
 }
 
-// Пол 5: Песок с камнями (улицы, мид)
+// Пол 5: Песок с камнями
 static void GenerateFloor_SandyStones(Color tex[TS][TS]) {
 	GenerateFloor_Sand(tex);
 	
@@ -671,74 +672,42 @@ static void GenerateFloor_RedTile(Color tex[TS][TS]) {
 		}
 	}
 }
+
+// Собираем все текстуры в кучу
+static void GenerateSky(void);
+void GenerateAllTextures(void) {
+	// Стены (8)
+	GenerateWall_SandBrick  (wallTex[0]);
+	GenerateWall_Stucco     (wallTex[1]);
+	GenerateWall_Stone      (wallTex[2]);
+	GenerateWall_WoodCrate  (wallTex[3]);
+	GenerateWall_MetalDoor  (wallTex[4]);
+	GenerateWall_Barrel     (wallTex[5]);
+	GenerateWall_DarkStucco (wallTex[6]);
+	GenerateWall_BrickMarked(wallTex[7]);
+	
+	// Полы (8)
+	GenerateFloor_Sand        (floorTex[0]);
+	GenerateFloor_SandTile    (floorTex[1]);
+	GenerateFloor_StoneTile   (floorTex[2]);
+	GenerateFloor_Gravel      (floorTex[3]);
+	GenerateFloor_Wood        (floorTex[4]);
+	GenerateFloor_SandyStones (floorTex[5]);
+	GenerateFloor_Dirt        (floorTex[6]);
+	GenerateFloor_RedTile     (floorTex[7]);
+	
+	// Небо
+	GenerateSky();
+}
 // ------------------------------------------------------------
-//  СЕКТОР 7: ПОТОЛКИ И НЕБО
+//  СЕКТОР 7: НЕБО (без потолков)
 // ------------------------------------------------------------
-
-// Потолок 0: Открытое небо (заглушка для внутренних помещений)
-static void GenerateCeil_Sky(Color tex[TS][TS]) {
-	for (int y = 0; y < TS; y++) {
-		for (int x = 0; x < TS; x++) {
-			float t = (float)y / TS;
-			tex[y][x] = (Color){
-				(unsigned char)(110 + t * 60),
-				(unsigned char)(150 + t * 50),
-				(unsigned char)(200 + t * 30),
-				255
-			};
-		}
-	}
-}
-
-// Потолок 1: Деревянные балки (внутри зданий)
-static void GenerateCeil_WoodBeams(Color tex[TS][TS]) {
-	Color beam = (Color){85, 60, 35, 255};
-	Color panel = (Color){60, 42, 28, 255};
-	
-	for (int y = 0; y < TS; y++) {
-		for (int x = 0; x < TS; x++) {
-			if (x % 8 == 0 || y % 8 == 0) {
-				tex[y][x] = beam;
-			} else {
-				float n = fbm(x * 0.4f, y * 0.4f, 2);
-				tex[y][x] = MixColor(panel, (Color){80, 60, 40, 255}, n);
-			}
-		}
-	}
-}
-
-// Потолок 2: Каменный (туннели)
-static void GenerateCeil_Stone(Color tex[TS][TS]) {
-	Color stone = (Color){70, 62, 50, 255};
-	Color stoneLight = (Color){95, 85, 68, 255};
-	
-	for (int y = 0; y < TS; y++) {
-		for (int x = 0; x < TS; x++) {
-			float n = fbm(x * 0.5f, y * 0.5f, 3);
-			tex[y][x] = MixColor(stone, stoneLight, n);
-		}
-	}
-}
-
-// Потолок 3: Песчаный (открытые зоны)
-static void GenerateCeil_Sand(Color tex[TS][TS]) {
-	Color base = (Color){180, 155, 115, 255};
-	Color dark = (Color){130, 110, 80, 255};
-	
-	for (int y = 0; y < TS; y++) {
-		for (int x = 0; x < TS; x++) {
-			float n = fbm(x * 0.3f, y * 0.3f, 2);
-			tex[y][x] = MixColor(dark, base, n);
-		}
-	}
-}
 
 static void GenerateSky(void) {
-	// 1. Базовый градиент ночного неба (симметричный для зенита)
+	// 1. Базовый градиент
 	for (int y = 0; y < SKY_H; y++) {
 		float t = (float)y / (float)SKY_H; 
 		Color c;
-		
 		if (t < 0.7f) {
 			float st = t / 0.7f;
 			c = (Color){(unsigned char)(5 + st * 10), (unsigned char)(5 + st * 15), (unsigned char)(20 + st * 25), 255};
@@ -751,14 +720,13 @@ static void GenerateSky(void) {
 		}
 	}
 	
-	// 2. Рассыпаем звезды (1500 штук для плотности)
+	// 2. Звёзды
 	for (int i = 0; i < 1500; i++) {
 		unsigned int h1 = hash2(i * 13, 42);
 		unsigned int h2 = hash2(i * 7, 1337);
 		unsigned int h3 = hash2(i * 3, 777);
 		
 		int sx = h1 % SKY_W;
-		// Звезды только в верхней половине неба
 		int sy = h2 % (int)(SKY_H * 0.6f); 
 		
 		Color starCol = (Color){255, 255, 255, 255};
@@ -781,38 +749,6 @@ static void GenerateSky(void) {
 	}
 }
 
-// Собираем все текстуры в кучу
-void GenerateAllTextures(void) {
-	// Стены (8)
-	GenerateWall_SandBrick  (wallTex[0]);
-	GenerateWall_Stucco     (wallTex[1]);
-	GenerateWall_Stone      (wallTex[2]);
-	GenerateWall_WoodCrate  (wallTex[3]);
-	GenerateWall_MetalDoor  (wallTex[4]);
-	GenerateWall_Barrel     (wallTex[5]);
-	GenerateWall_DarkStucco (wallTex[6]);
-	GenerateWall_BrickMarked(wallTex[7]);
-	
-	// Полы (8)
-	GenerateFloor_Sand        (floorTex[0]);
-	GenerateFloor_SandTile    (floorTex[1]);
-	GenerateFloor_StoneTile   (floorTex[2]);
-	GenerateFloor_Gravel      (floorTex[3]);
-	GenerateFloor_Wood        (floorTex[4]);
-	GenerateFloor_SandyStones (floorTex[5]);
-	GenerateFloor_Dirt        (floorTex[6]);
-	GenerateFloor_RedTile     (floorTex[7]);
-	
-	// Потолки (4)
-	GenerateCeil_Sky      (ceilTex[0]);
-	GenerateCeil_WoodBeams(ceilTex[1]);
-	GenerateCeil_Stone    (ceilTex[2]);
-	GenerateCeil_Sand     (ceilTex[3]);
-	
-	// Небо
-	GenerateSky();
-}
-
 // ------------------------------------------------------------
 //  СЕКТОР 8: АУДИО (Глобальные настройки)
 // -----------------------------------------------------------
@@ -821,7 +757,7 @@ static float volume_ui_timer = 0.0f;
 static float stamina_ui_timer = 0.0f;
 
 // ------------------------------------------------------------
-//  СЕКТОР 9: КАРТА ИЗ ПРОЕКТА 1 (С текстурами Dust2)
+//  СЕКТОР 9: КАРТА
 // ------------------------------------------------------------
 
 static void SetCell(int x, int y, CellType type, int wtex, int ftex, int ctex, float fz, float cz) {
@@ -1167,74 +1103,88 @@ static bool CanStandAt(float wx, float wy, float z, bool allowStepUp) {
 	return true;
 }
 
-		void SpawnBulletHole(float startX, float startY, float startZ, float dirX, float dirY, float dirZ, float maxDist) {
-			int mapX = (int)floorf(startX);
-			int mapY = (int)floorf(startY);
+void SpawnBulletHole(float startX, float startY, float startZ, float dirX, float dirY, float dirZ, float maxDist) {
+	int mapX = (int)floorf(startX);
+	int mapY = (int)floorf(startY);
+	
+	float deltaDistX = (fabsf(dirX) < 1e-6f) ? 1e30f : fabsf(1.0f / dirX);
+	float deltaDistY = (fabsf(dirY) < 1e-6f) ? 1e30f : fabsf(1.0f / dirY);
+	float sideDistX, sideDistY;
+	int stepX, stepY;
+	
+	if (dirX < 0) { stepX = -1; sideDistX = (startX - mapX) * deltaDistX; }
+	else { stepX = 1; sideDistX = (mapX + 1.0f - startX) * deltaDistX; }
+	if (dirY < 0) { stepY = -1; sideDistY = (startY - mapY) * deltaDistY; }
+	else { stepY = 1; sideDistY = (mapY + 1.0f - startY) * deltaDistY; }
+	
+	bool hit = false;
+	int side = 0;
+	float perpDist = 0.0f;
+	
+	while (!hit) {
+		if (sideDistX < sideDistY) {
+			sideDistX += deltaDistX;
+			mapX += stepX;
+			side = 0;
+		} else {
+			sideDistY += deltaDistY;
+			mapY += stepY;
+			side = 1;
+		}
+		
+		if (mapX < 0 || mapX >= MW || mapY < 0 || mapY >= MH) break;
+		
+		perpDist = (side == 0) ? (mapX - startX + (1 - stepX) / 2.0f) / dirX : (mapY - startY + (1 - stepY) / 2.0f) / dirY;
+		if (perpDist > maxDist) break;
+		
+		Cell *c = &map[mapX][mapY];
+		float floorZ = c->floorZ;
+		float ceilZ = c->ceilZ;
+		float hitZ = startZ + dirZ * perpDist;
+		
+		// ЗАЩИТА: Если пуля летит выше потолка (в открытое небо) — убираем её без дырок
+		if (hitZ > Z_HIGHCEIL) {
+			return;
+		}
+		
+		// Попадание в пол
+		if (hitZ < floorZ && dirZ < 0.0f) {
+			float tFloor = (floorZ - startZ) / dirZ;
+			float hitX = startX + dirX * tFloor;
+			float hitY = startY + dirY * tFloor;
 			
-			float deltaDistX = (fabsf(dirX) < 1e-6f) ? 1e30f : fabsf(1.0f / dirX);
-			float deltaDistY = (fabsf(dirY) < 1e-6f) ? 1e30f : fabsf(1.0f / dirY);
-			float sideDistX, sideDistY;
-			int stepX, stepY;
-			
-			if (dirX < 0) { stepX = -1; sideDistX = (startX - mapX) * deltaDistX; }
-			else { stepX = 1; sideDistX = (mapX + 1.0f - startX) * deltaDistX; }
-			if (dirY < 0) { stepY = -1; sideDistY = (startY - mapY) * deltaDistY; }
-			else { stepY = 1; sideDistY = (mapY + 1.0f - startY) * deltaDistY; }
-			
-			bool hit = false;
-			int side = 0;
-			float perpDist = 0.0f;
-			float hitX = 0, hitY = 0;
-			
-			while (!hit && perpDist < maxDist) {
-				if (sideDistX < sideDistY) {
-					sideDistX += deltaDistX;
-					mapX += stepX;
-					side = 0;
-				} else {
-					sideDistY += deltaDistY;
-					mapY += stepY;
-					side = 1;
-				}
-				
-				if (mapX < 0 || mapX >= MW || mapY < 0 || mapY >= MH) break;
-				
-				if (map[mapX][mapY].type == CELL_WALL || map[mapX][mapY].type == CELL_CRATE) {
-					hit = true;
-					perpDist = (side == 0) ? (mapX - startX + (1 - stepX) / 2.0f) / dirX : (mapY - startY + (1 - stepY) / 2.0f) / dirY;
-					
-					hitX = startX + dirX * perpDist;
-					hitY = startY + dirY * perpDist;
-					float hitZ = startZ + dirZ * perpDist;
-					
-					// --- ПРОВЕРКА: НЕ УШЛА ЛИ ПУЛЯ В НЕБО ИЛИ ПОЛ ---
-					// Если Z больше потолка (2.5) или меньше пола (0.0) — не создаём дырку
-					float ceilZ = Z_HIGHCEIL;
-					float floorZ = Z_FLOOR;
-					
-					// Берем высоту потолка из клетки (если там стена)
-					if (map[mapX][mapY].type == CELL_WALL) {
-						ceilZ = map[mapX][mapY].ceilZ;
-					}
-					
-					// Если дырка выше потолка или ниже пола — выходим
-					if (hitZ > ceilZ || hitZ < floorZ) {
-						return;
-					}
-					
-					// Ищем свободный слот
-					for (int i = 0; i < MAX_BULLETS; i++) {
-						if (!bulletHoles[i].active) {
-							bulletHoles[i].active = true;
-							bulletHoles[i].x = hitX;
-							bulletHoles[i].y = hitY;
-							bulletHoles[i].z = hitZ;
-							return;
-						}
-					}
+			for (int i = 0; i < MAX_BULLETS; i++) {
+				if (!bulletHoles[i].active) {
+					bulletHoles[i].active = true;
+					bulletHoles[i].x = hitX;
+					bulletHoles[i].y = hitY;
+					bulletHoles[i].z = floorZ; 
+					return;
 				}
 			}
+			return;
 		}
+		
+		// Попадание в стену или ящик
+		if (c->type == CELL_WALL || c->type == CELL_CRATE) {
+			if (hitZ >= floorZ && hitZ <= ceilZ) {
+				float hitX = startX + dirX * perpDist;
+				float hitY = startY + dirY * perpDist;
+				
+				for (int i = 0; i < MAX_BULLETS; i++) {
+					if (!bulletHoles[i].active) {
+						bulletHoles[i].active = true;
+						bulletHoles[i].x = hitX;
+						bulletHoles[i].y = hitY;
+						bulletHoles[i].z = hitZ;
+						return; 
+					}
+				}
+				return; 
+			}
+		}
+	}
+}
 
 void FireWeapon(void) {
 	if (pistol.isReloading) return;
@@ -1254,44 +1204,52 @@ void FireWeapon(void) {
 	
 	if (pistol.sndShot.frameCount > 0) PlaySound(pistol.sndShot);
 	
-	// --- ВЫЧИСЛЯЕМ ПОЗИЦИЮ СТВОЛА (для гильзы) ---
-	float rightX = sinf(player.pa);
-	float rightY = -cosf(player.pa);
-	float muzzleX = player.x + cosf(player.pa) * 0.5f + rightX * 0.3f;
-	float muzzleY = player.y + sinf(player.pa) * 0.5f + rightY * 0.3f;
+	// Позиция ствола для гильзы (ИСПРАВЛЕНО: right = вправо, ближе к стволу)
+	float rightX = -sinf(player.pa);
+	float rightY =  cosf(player.pa);
+	float muzzleX = player.x + cosf(player.pa) * 0.4f + rightX * 0.15f;
+	float muzzleY = player.y + sinf(player.pa) * 0.4f + rightY * 0.15f;
 	float muzzleZ = player.z + EYE_HEIGHT - 0.1f;
 	
-	// --- СТРЕЛЬБА В ЦЕНТР ПРИЦЕЛА ---
-	// Берем позицию прицела на экране (crosshairX + отдача)
+	// ФАКТИЧЕСКИЕ ЭКРАННЫЕ КООРДИНАТЫ ПРИЦЕЛА
 	float screenAimX = player.crosshairX + player.aimSpreadX;
 	float screenAimY = player.crosshairY + player.aimSpreadY;
 	
-	// Переводим экранные координаты в углы
-	float fovScale = tanf(fov * 0.5f);
-	float angleOffsetX = (screenAimX / (SW / 2.0f)) * fovScale;
-	float angleOffsetY = (screenAimY / (SH / 2.0f)) * fovScale;
+	// Текущий экранный Y прицела от верха экрана
+	float aimPixelY = (float)SH / 2.0f + screenAimY;
 	
-	// Вектор направления пули
-	float rayDirX = cosf(player.pa) - sinf(player.pa) * angleOffsetX;
-	float rayDirY = sinf(player.pa) + cosf(player.pa) * angleOffsetX;
-	float rayDirZ = -angleOffsetY;
+	float dirX = cosf(player.pa);
+	float dirY = sinf(player.pa);
+	float planeLen = tanf(fov * 0.5f);
+	float planeX = -dirY * planeLen;
+	float planeY = dirX * planeLen;
 	
-	// Нормализуем
-	float len = sqrtf(rayDirX*rayDirX + rayDirY*rayDirY + rayDirZ*rayDirZ);
-	rayDirX /= len; rayDirY /= len; rayDirZ /= len;
+	float projPlane = (float)SH * 0.5f / tanf(fov * 0.5f);
+	float camXc = screenAimX / ((float)SW * 0.5f); 
 	
-	// Создаем дырку в мире
+	float rayDirX = dirX + planeX * camXc;
+	float rayDirY = dirY + planeY * camXc;
+	
+	// Вычисляем заново horizon, как он считается в рендере (без покачивания bobV для точности выстрела)
+	float pitchOffset = tanf(player.pitch) * projPlane;
+	float currentHorizon = (float)SH / 2.0f + pitchOffset;
+	
+	// ЧЕСТНЫЙ тангенс угла пули, завязанный напрямую на пиксель прицела и горизонт
+	// Направление Z = (физический Y горизонта на экране - Y прицела на экране) / projPlane
+	float rayDirZ = (currentHorizon - aimPixelY) / projPlane;
+	
+	// Отправляем пулю в DDA
 	SpawnBulletHole(player.x, player.y, player.z + EYE_HEIGHT, rayDirX, rayDirY, rayDirZ, 50.0f);
 	
-	// --- СПАВН ГИЛЬЗЫ ---
+		// Спавн гильзы (ИСПРАВЛЕНО: медленнее, ближе к стволу)
 	for (int i = 0; i < MAX_SHELLS; i++) {
 		if (!shells[i].active) {
 			shells[i].active = true;
 			shells[i].x = muzzleX;
 			shells[i].y = muzzleY;
 			shells[i].z = muzzleZ;
-			shells[i].vx = cosf(player.pa) * 2.0f + rightX * 3.0f + (rand() % 100 - 50) * 0.02f;
-			shells[i].vy = sinf(player.pa) * 2.0f + rightY * 3.0f + (rand() % 100 - 50) * 0.02f;
+			shells[i].vx = cosf(player.pa) * 1.5f + rightX * 1.0f + (rand() % 100 - 50) * 0.02f;
+			shells[i].vy = sinf(player.pa) * 1.5f + rightY * 1.0f + (rand() % 100 - 50) * 0.02f;
 			shells[i].vz = 2.5f + (rand() % 100 - 50) * 0.02f;
 			shells[i].life = 5.0f;
 			break;
@@ -1299,16 +1257,15 @@ void FireWeapon(void) {
 	}
 }
 
-
 void UpdateShells(float dt) {
 	for (int i = 0; i < MAX_SHELLS; i++) {
 		if (!shells[i].active) continue;
 		
 		shells[i].life -= dt;
-		if (shells[i].life <= 0.0f) {
-			shells[i].active = false;
-			continue;
-		}
+
+		float drag = expf(-1.5f * dt);
+		shells[i].vx *= drag;
+		shells[i].vy *= drag;
 		
 		shells[i].vz -= 9.8f * dt;
 		
@@ -1316,16 +1273,11 @@ void UpdateShells(float dt) {
 		float ny = shells[i].y + shells[i].vy * dt;
 		float nz = shells[i].z + shells[i].vz * dt;
 		
-		if (nz < Z_FLOOR + 0.05f) {
-			nz = Z_FLOOR + 0.05f;
-			shells[i].vz = -shells[i].vz * 0.4f;
-			shells[i].vx *= 0.7f;
-			shells[i].vy *= 0.7f;
-			if (fabsf(shells[i].vz) < 0.5f) {
-				shells[i].vz = 0.0f;
-				shells[i].vx *= 0.5f;
-				shells[i].vy *= 0.5f;
-			}
+		if (nz < Z_FLOOR + 0.02f) { // Чуть ниже, чтобы визуально касалась пола
+		nz = Z_FLOOR + 0.02f;
+		shells[i].vz = 0.0f; // Жестко останавливаем по вертикали
+		shells[i].vx = 0.0f; // И по горизонтали (лежит на полу)
+		shells[i].vy = 0.0f;
 		}
 		
 		int mapX = (int)floorf(nx);
@@ -1346,14 +1298,13 @@ void UpdateShells(float dt) {
 }
 
 void UpdatePlayer(float dt) {
-	Vector2 md = GetMouseDelta();
+		Vector2 md = GetMouseDelta();
 	
-	// --- 1. ДВИГАЕМ ПРИЦЕЛ ВНУТРИ ЭКРАНА (Свободный обзор) ---
+	// --- 1. ДВИГАЕМ ПРИЦЕЛ ВНУТРИ ЭКРАНА ---
 	float aimSensitivity = 1.5f; 
 	player.crosshairX += md.x * aimSensitivity;
 	player.crosshairY += md.y * aimSensitivity;
 	
-	// Ограничиваем прицел "мертвой зоной" (чтобы он не улетал за край)
 	float limitX = 300.0f;
 	float limitY = 200.0f;
 	
@@ -1367,18 +1318,22 @@ void UpdatePlayer(float dt) {
 		player.crosshairX = -limitX;
 	}
 	
+	// Крутим камеру вверх/вниз (pitch теперь в радианах!)
+	float pitchSpeed = 0.002f; 
 	if (player.crosshairY > limitY) {
-		player.pitch -= (player.crosshairY - limitY) * 0.1f;
+		player.pitch -= (player.crosshairY - limitY) * pitchSpeed;
 		player.crosshairY = limitY;
 	}
 	if (player.crosshairY < -limitY) {
-		player.pitch -= (player.crosshairY + limitY) * 0.1f;
+		player.pitch -= (player.crosshairY + limitY) * pitchSpeed;
 		player.crosshairY = -limitY;
 	}
 	
-	// Защита от переполнения углов
-	if (player.pitch >  180.0f) player.pitch =  180.0f;
-	if (player.pitch < -180.0f) player.pitch = -180.0f;
+	// Ограничиваем наклон камеры (используем MAX_PITCH, который мы добавили в начале)
+	if (player.pitch > MAX_PITCH) player.pitch = MAX_PITCH;
+	if (player.pitch < -MAX_PITCH) player.pitch = -MAX_PITCH;
+	
+	// Защита от переполнения горизонтального угла
 	if (player.pa < 0.0f)      player.pa += 2.0f * PI;
 	if (player.pa > 2.0f * PI) player.pa -= 2.0f * PI;
 	
@@ -1525,8 +1480,9 @@ void UpdatePlayer(float dt) {
 }
 
 // ------------------------------------------------------------
-//  СЕКТОР 11: РЕНДЕР (Стабильный, с защитой от вылетов)
+//  СЕКТОР 11: РЕНДЕР (ПОЛНОСТЬЮ ИСПРАВЛЕННЫЙ, МОНОЛИТНЫЙ)
 // ------------------------------------------------------------
+
 void RenderFrame(Color *pixels) {
 	float dirX = cosf(player.pa), dirY = sinf(player.pa);
 	float planeLen = tanf(fov * 0.5f);
@@ -1536,33 +1492,30 @@ void RenderFrame(Color *pixels) {
 	float bobV = sinf(player.bobPhase * 2.0f) * 6.0f * player.bobAmount;
 	float bobH = cosf(player.bobPhase) * 4.0f * player.bobAmount;
 	
-	int horizon = (int)(SH / 2.0f + player.pitch + bobV);
 	float projPlane = (float)SH * 0.5f / tanf(fov * 0.5f);
+	float pitchOffset = tanf(player.pitch) * projPlane;
+	int horizon = (int)(SH / 2.0f + pitchOffset + bobV); 
+	float rayDirZ = tanf(player.pitch);
 	
 	// Луна
 	float moonAngle = 2.5f; 
 	float angleDiff = moonAngle - player.pa;
 	while (angleDiff > PI) { angleDiff -= 2.0f * PI; }
 	while (angleDiff < -PI) { angleDiff += 2.0f * PI; }
-		int moonX = -9999; // По умолчанию за экраном
-	if (fabsf(angleDiff) < 1.45f) { // Защита от PI/2
+	int moonX = -9999;
+	if (fabsf(angleDiff) < 1.45f) {
 		moonX = (int)((SW / 2.0f) + tanf(angleDiff) * (SW / 2.0f) / tanf(fov/2.0f));
 	}
 	int moonY = (int)(horizon - 250.0f); 
 	int moonR = 40;
 	
-// ===== ПРОХОД 1: DDA =====
+	// ===== ПРОХОД 1: DDA (СТЕНЫ) =====
 #pragma omp parallel for num_threads(cpu_threads)
 	for (int x = 0; x < SW; x++) {
-		// Смещаем камеру по X на позицию прицела (свободный обзор)
-		float camXc = 2.0f * ((float)x / (float)SW) - 1.0f;
-		// Keep camera rays centered; crosshair moves independently.
-		
-		camXc += bobH / (float)SW;
+		float camXc = 2.0f * ((float)x / (float)SW) - 1.0f + bobH / (float)SW;
 		float rayDirX = dirX + planeX * camXc, rayDirY = dirY + planeY * camXc;
 		int mapX = (int)floorf(camX), mapY = (int)floorf(camY);
 		
-		// Безопасное деление
 		float deltaDistX = (fabsf(rayDirX) < 1e-6f) ? 1e30f : fabsf(1.0f / rayDirX);
 		float deltaDistY = (fabsf(rayDirY) < 1e-6f) ? 1e30f : fabsf(1.0f / rayDirY);
 		float sideDistX, sideDistY; int stepX, stepY;
@@ -1577,265 +1530,206 @@ void RenderFrame(Color *pixels) {
 			if (mapX < 0 || mapX >= MW || mapY < 0 || mapY >= MH) { hit = true; break; }
 			
 			Cell *c = &map[mapX][mapY];
-			if (c->type == CELL_WALL || c->type == CELL_CRATE) {
-				hit = true;
-			}
+			if (c->type == CELL_WALL || c->type == CELL_CRATE) hit = true;
 		}
 		
 		float perpDist = (side == 0) ? (mapX - camX + (1 - stepX)/2.0f) / rayDirX : (mapY - camY + (1 - stepY)/2.0f) / rayDirY;
-		if (perpDist < 0.1f) { perpDist = 0.1f; } // Защита от каши у стены
+		if (perpDist < 0.1f) perpDist = 0.1f;
 		zbuf[x] = perpDist;
 		
 		float wallFloorZ = Z_FLOOR, wallCeilZ = Z_CEIL; int wallTexID = 0;
 		if (mapX >= 0 && mapX < MW && mapY >= 0 && mapY < MH) {
 			Cell *c = &map[mapX][mapY]; 
-			wallFloorZ = c->floorZ; 
-			wallCeilZ = c->ceilZ; 
-			wallTexID = c->wallTex;
-			if (wallTexID >= N_WALL_TEX) { wallTexID = 0; } // Защита от выхода за массив текстур
+			wallFloorZ = c->floorZ; wallCeilZ = c->ceilZ; wallTexID = c->wallTex;
+			if (wallTexID >= N_WALL_TEX) wallTexID = 0;
 		}
 		
 		float yTop = horizon - (wallCeilZ - camZ) / perpDist * projPlane;
 		float yBottom = horizon - (wallFloorZ - camZ) / perpDist * projPlane;
 		
 		rawStartBuf[x] = (int)yTop; rawEndBuf[x] = (int)yBottom;
-		int drawStart = (int)yTop;
-		int drawEnd = (int)yBottom;
-		if (drawStart < 0) { drawStart = 0; }
-		if (drawEnd > SH) { drawEnd = SH; }
-		if (drawEnd <= drawStart) { drawEnd = drawStart + 1; } 
+		int drawStart = (int)yTop;  int drawEnd = (int)yBottom;
+		if (drawStart < 0) drawStart = 0;
+		if (drawEnd > SH) drawEnd = SH;
+		if (drawEnd <= drawStart) drawEnd = drawStart + 1;
 		
 		float sampleX = (side == 0) ? camY + perpDist * rayDirY : camX + perpDist * rayDirX;
 		sampleX -= floorf(sampleX);
-		int tx = (int)(sampleX * TS) & (TS - 1); 
-		if (tx < 0) { tx += TS; }
+		int tx = (int)(sampleX * TS) & (TS - 1);
+		if (tx < 0) tx += TS;
 		
-		drawStartBuf[x] = drawStart; 
-		drawEndBuf[x] = drawEnd; 
-		texIDBuf[x] = wallTexID;
-		txBuf[x] = tx; 
-		sideBuf[x] = side; 
-		perpBuf[x] = perpDist;
+		drawStartBuf[x] = drawStart; drawEndBuf[x] = drawEnd; texIDBuf[x] = wallTexID;
+		txBuf[x] = tx; sideBuf[x] = side; perpBuf[x] = perpDist;
 	}
 	
-// ===== ПРОХОД 2: РАСТЕРИЗАЦИЯ =====
+	// ===== ПРОХОД 2: РАСТЕРИЗАЦИЯ (СТЕНЫ И ПОЛ) =====
 #pragma omp parallel for num_threads(cpu_threads)
 	for (int y = 0; y < SH; y++) {
 		Color *row = pixels + y * SW;
-		
-				// 1. Вычисляем Y для неба (фиксированное, не зависимое от наклона головы)
 		int skyY = (int)((float)y - horizon + SKY_H * 0.5f);
-		if (skyY < 0) skyY = 0;
-		if (skyY >= SKY_H) skyY = SKY_H - 1;
+		if (skyY < 0) skyY = 0; if (skyY >= SKY_H) skyY = SKY_H - 1;
 		
-		// 2. РИСУЕМ НЕБО И ЛУНУ
 		for (int x = 0; x < SW; x++) {
-			// БЕСШОВНОЕ ВЫЧИСЛЕНИЕ УГЛА (без fmod и %)
 			float camXc = 2.0f * ((float)x / (float)SW) - 1.0f;
-						// Сдвигаем небо с учетом прицела
-						float rayAngle = player.pa + camXc * (fov * 0.5f);
-			
-			// Нормализуем угол в диапазон [0, 2*PI]
+			float rayAngle = player.pa + camXc * (fov * 0.5f);
 			float normAngle = rayAngle;
 			while (normAngle < 0.0f) normAngle += 2.0f * PI;
 			while (normAngle >= 2.0f * PI) normAngle -= 2.0f * PI;
 			
-			// Теперь переводим в пиксели (гарантированно в диапазоне)
 			int skyX = (int)((normAngle / (2.0f * PI)) * (float)SKY_W);
-			if (skyX < 0) skyX = 0;
-			if (skyX >= SKY_W) skyX = SKY_W - 1; // Жесткая защита
+			if (skyX < 0) skyX = 0; if (skyX >= SKY_W) skyX = SKY_W - 1;
 			
-			// --- КРАСИВАЯ ЛУНА ---
-			int dx = x - moonX;
-			int dy = y - moonY;
+			int dx = x - moonX; int dy = y - moonY;
 			float distSq = (float)(dx*dx + dy*dy);
 			float radiusSq = (float)(moonR * moonR);
 			
 			if (distSq < radiusSq) {
-				float nx = (float)dx / (float)moonR;
-				float ny = (float)dy / (float)moonR;
-				unsigned char baseR = 240, baseG = 240, baseB = 220;
+				float nx = (float)dx / (float)moonR; float ny = (float)dy / (float)moonR;
 				float distFromCenter = sqrtf(nx*nx + ny*ny);
 				float shading = 1.0f - (distFromCenter * 0.3f);
-				
 				float craterNoise = fbm(nx * 3.0f + 10.0f, ny * 3.0f + 10.0f, 3);
-				float craterDarkness = 0.0f;
-				if (craterNoise > 0.45f && craterNoise < 0.6f) craterDarkness = 0.25f;
-				else if (craterNoise <= 0.45f) craterDarkness = 0.1f;
-				
-				row[x] = (Color){
-					(unsigned char)(baseR * shading * (1.0f - craterDarkness)),
-					(unsigned char)(baseG * shading * (1.0f - craterDarkness)),
-					(unsigned char)(baseB * shading * (1.0f - craterDarkness * 0.8f)),
-					255
-				};
+				float craterDarkness = (craterNoise > 0.45f && craterNoise < 0.6f) ? 0.25f : 0.1f;
+				row[x] = (Color){ (unsigned char)(240 * shading * (1.0f - craterDarkness)), (unsigned char)(240 * shading * (1.0f - craterDarkness)), (unsigned char)(220 * shading * (1.0f - craterDarkness * 0.8f)), 255 };
 			} else if (distSq < radiusSq * 2.5f) {
 				float glowFactor = 1.0f - (sqrtf(distSq) - (float)moonR) / ((float)moonR * 1.5f);
 				if (glowFactor < 0.0f) glowFactor = 0.0f;
-				Color glowCol = (Color){100, 120, 160, 255};
 				Color skyCol = skyTex[skyY][skyX];
-				row[x] = (Color){
-					(unsigned char)(skyCol.r + (glowCol.r - skyCol.r) * glowFactor * 0.4f),
-					(unsigned char)(skyCol.g + (glowCol.g - skyCol.g) * glowFactor * 0.4f),
-					(unsigned char)(skyCol.b + (glowCol.b - skyCol.b) * glowFactor * 0.4f),
-					255
-				};
+				row[x] = (Color){ (unsigned char)(skyCol.r + (100 - skyCol.r) * glowFactor * 0.4f), (unsigned char)(skyCol.g + (120 - skyCol.g) * glowFactor * 0.4f), (unsigned char)(skyCol.b + (160 - skyCol.b) * glowFactor * 0.4f), 255 };
 			} else {
 				row[x] = skyTex[skyY][skyX];
 			}
 		}
 		
-// 3. РИСУЕМ СТЕНЫ И ПОЛ
 		for (int x = 0; x < SW; x++) {
 			int ds = drawStartBuf[x], de = drawEndBuf[x];
-			
 			if (y >= ds && y < de) {
-				// --- СТЕНА ---
-				int lineHeight = rawEndBuf[x] - rawStartBuf[x]; 
+				int lineHeight = rawEndBuf[x] - rawStartBuf[x];
 				if (lineHeight < 1) lineHeight = 1;
-				float texY = (float)(y - rawStartBuf[x]) / (float)lineHeight;
-				int ty = (int)(texY * TS); 
-				if (ty < 0) ty = 0;
-				if (ty >= TS) ty = TS - 1;
-				
+				int ty = (int)(((float)(y - rawStartBuf[x]) / (float)lineHeight) * TS);
+				if (ty < 0) ty = 0; if (ty >= TS) ty = TS - 1;
 				Color c = wallTex[texIDBuf[x]][ty][txBuf[x]];
 				float shade = 1.0f - (perpBuf[x] / depth) * 0.85f;
 				if (shade < 0.2f) shade = 0.2f;
 				if (sideBuf[x] == 1) shade *= 0.75f;
 				c.r = (unsigned char)(c.r * shade); c.g = (unsigned char)(c.g * shade); c.b = (unsigned char)(c.b * shade);
 				row[x] = c;
-			} else if (y >= de && y >= horizon && de < SH) {
-				// --- ПОЛ ---
-				float p = (float)y - horizon;
-				if (p < 1.0f) p = 1.0f;
+			} else if (y > de) {
 				float camXc = 2.0f * ((float)x / (float)SW) - 1.0f;
-				float rayDirX = dirX + planeX * camXc;
-				float rayDirY = dirY + planeY * camXc;
-				float rd = (camZ - Z_FLOOR) * projPlane / p;
-				if (rd > depth) rd = depth;
-				float floorX = camX + rayDirX * rd;
-				float floorY = camY + rayDirY * rd;
-				int cellX = (int)floorf(floorX), cellY = (int)floorf(floorY);
-				int ftex = 0;
-				if (cellX >= 0 && cellX < MW && cellY >= 0 && cellY < MH) {
-					ftex = map[cellX][cellY].floorTex;
-					if (ftex >= N_FLOOR_TEX) ftex = 0;
-				}
-				int ftx = (int)((floorX - (float)cellX) * (float)TS); 
-				if (ftx < 0) ftx = 0;
-				if (ftx >= TS) ftx = TS - 1;
-				int fty = (int)((floorY - (float)cellY) * (float)TS); 
-				if (fty < 0) fty = 0;
-				if (fty >= TS) fty = TS - 1;
-				Color c = floorTex[ftex][fty][ftx];
-				float fshade = 1.0f - (rd / depth) * 0.85f;
-				if (fshade < 0.2f) fshade = 0.2f;
-				c.r = (unsigned char)(c.r * fshade); c.g = (unsigned char)(c.g * fshade); c.b = (unsigned char)(c.b * fshade);
-				row[x] = c;
-			}
-		}
-		
-// ============================================================
-		// 4. РИСУЕМ ГИЛЬЗЫ (БОЛЬШИЕ)
-		// ============================================================
-		for (int i = 0; i < MAX_SHELLS; i++) {
-			if (!shells[i].active) continue;
-			
-			float dx = shells[i].x - camX;
-			float dy = shells[i].y - camY;
-			float dz = shells[i].z - camZ;
-			
-			float projDist = dx * dirX + dy * dirY;
-			if (projDist < 0.1f) continue;
-			
-			float screenX = (SW / 2.0f) + (dx * (-dirY) + dy * dirX) / (projDist * planeLen) * (SW * 0.5f);
-			float screenY = horizon - (dz / projDist) * projPlane;
-			
-			int px = (int)screenX;
-			int py = (int)screenY;
-			
-			// Радиус гильзы (такой же как у дырки)
-			int radius = (int)(6.0f / (projDist * 0.2f + 1.0f));
-			if (radius < 1) radius = 1;
-			if (radius > 6) radius = 6; 
-			
-			if (px >= radius && px < SW - radius && py >= radius && py < SH - radius) {
-				if (projDist < zbuf[px]) {
-					Color shellColor = (Color){255, 220, 80, 255}; 
-					
-					// Рисуем круглую гильзу
-					int dy_circle = y - py;
-					if (dy_circle >= -radius && dy_circle <= radius) {
-						int halfWidth = (int)sqrtf((float)(radius * radius - dy_circle * dy_circle));
-						for (int ox = -halfWidth; ox <= halfWidth; ox++) {
-							int drawX = px + ox;
-							if (drawX >= 0 && drawX < SW) {
-								row[drawX] = shellColor;
-							}
-						}
+				float rayDirX = dirX + planeX * camXc, rayDirY = dirY + planeY * camXc;
+				float p = (float)y - horizon;
+				float tanAngle = (p / projPlane);
+				if (tanAngle > 0.0f) {
+					float rd = (camZ - Z_FLOOR) / tanAngle;
+					if (rd > depth) rd = depth;
+					float floorX = camX + rayDirX * rd, floorY = camY + rayDirY * rd;
+					int cellX = (int)floorf(floorX), cellY = (int)floorf(floorY);
+					int ftex = 0;
+					if (cellX >= 0 && cellX < MW && cellY >= 0 && cellY < MH) {
+						ftex = map[cellX][cellY].floorTex;
+						if (ftex >= N_FLOOR_TEX) ftex = 0;
 					}
+					int ftx = (int)((floorX - (float)cellX) * (float)TS);
+					if (ftx < 0) ftx = 0; if (ftx >= TS) ftx = TS - 1;
+					int fty = (int)((floorY - (float)cellY) * (float)TS);
+					if (fty < 0) fty = 0; if (fty >= TS) fty = TS - 1;
+					Color c = floorTex[ftex][fty][ftx];
+					float fshade = 1.0f - (rd / depth) * 0.85f;
+					if (fshade < 0.2f) fshade = 0.2f;
+					c.r = (unsigned char)(c.r * fshade); c.g = (unsigned char)(c.g * fshade); c.b = (unsigned char)(c.b * fshade);
+					row[x] = c;
 				}
 			}
 		}
+	}
+	
+// ===== ПРОХОД 3: ЧЕСТНЫЙ 2D-НАКЛАД ДЕКАЛЕЙ И СПРАЙТОВ =====
+	
+	// 1. ОТРЕСОВКА ДЫРОК ОТ ПУЛЬ
+	for (int i = 0; i < MAX_BULLETS; i++) {
+		if (!bulletHoles[i].active) continue;
+		float dx = bulletHoles[i].x - camX, dy = bulletHoles[i].y - camY;
+		float projDist = dx * dirX + dy * dirY;
+		if (projDist < 0.2f) continue;
 		
-		// ============================================================
-		// КОНЕЦ БЛОКА ГИЛЬЗ
-		// ============================================================
+		int px = (int)((SW / 2.0f) + (dx * (-dirY) + dy * dirX) / (projDist * planeLen) * (SW * 0.5f));
+		if (px < 0 || px >= SW) continue;
 		
-		// ============================================================
-		// 5. РИСУЕМ ДЫРКИ ОТ ПУЛЬ (БОЛЬШИЕ, НО ЧУТЬ МЕНЬШЕ)
-		// ============================================================
-		for (int i = 0; i < MAX_BULLETS; i++) {
-			if (!bulletHoles[i].active) continue;
+		// ИСПРАВЛЕНО: проверка глубины ТОЛЬКО по центру, до отрисовки круга
+		if (projDist > zbuf[px] + 0.3f) continue;
+		
+		float pureHorizon = (float)SH / 2.0f + rayDirZ * projPlane;
+		int py = (int)(pureHorizon - (bulletHoles[i].z - camZ) / projDist * projPlane + bobV);
+		
+		int radius = (int)(8.0f / (projDist * 0.2f + 1.0f));
+		if (radius < 2) radius = 2; if (radius > 10) radius = 10;
+		
+		for (int sy = py - radius; sy <= py + radius; sy++) {
+			if (sy < 0 || sy >= SH) continue;
+			int dy_circle = sy - py;
+			int halfWidth = (int)sqrtf((float)(radius * radius - dy_circle * dy_circle));
+			Color *row = pixels + sy * SW;
 			
-			float dx = bulletHoles[i].x - camX;
-			float dy = bulletHoles[i].y - camY;
-			float dz = bulletHoles[i].z - camZ;
-			
-			float projDist = dx * dirX + dy * dirY;
-			if (projDist < 0.5f) continue; 
-			
-			float screenX = (SW / 2.0f) + (dx * (-dirY) + dy * dirX) / (projDist * planeLen) * (SW * 0.5f);
-			float screenY = horizon - (dz / projDist) * projPlane;
-			
-			int px = (int)screenX;
-			int py = (int)screenY;
-			
-			// Радиус дырки (уменьшен до 10)
-			int radius = (int)(8.0f / (projDist * 0.2f + 1.0f));
-			if (radius < 2) radius = 2;
-			if (radius > 10) radius = 10; // Максимум 10 пикселей
-			
-			// Рисуем дырку, только если центр в кадре
-			if (px >= radius && px < SW - radius && py >= radius && py < SH - radius) {
-				if (projDist < zbuf[px]) {
-					Color holeColor = (Color){20, 20, 20, 255}; 
-					Color rimColor = (Color){100, 100, 100, 255};
-					
-					// Рисуем круг (только строки, которые попадают в текущий y)
-					int dy_circle = y - py;
-					if (dy_circle >= -radius && dy_circle <= radius) {
-						// Вычисляем ширину круга для этой строки
-						int halfWidth = (int)sqrtf((float)(radius * radius - dy_circle * dy_circle));
-						
-						for (int ox = -halfWidth; ox <= halfWidth; ox++) {
-							int drawX = px + ox;
-							if (drawX >= 0 && drawX < SW) {
-								// Определяем цвет (центр темный, края светлее)
-								if (abs(ox) > halfWidth - 2) {
-									row[drawX] = rimColor; // Окантовка
-								} else {
-									row[drawX] = holeColor; // Темный центр
-								}
-							}
-						}
-					}
-				}
+			for (int sx_loop = px - halfWidth; sx_loop <= px + halfWidth; sx_loop++) {
+				if (sx_loop < 0 || sx_loop >= SW) continue;
+				if (abs(sx_loop - px) > halfWidth - 2) row[sx_loop] = (Color){100, 100, 100, 255};
+				else row[sx_loop] = (Color){20, 20, 20, 255};
 			}
 		}
+	}
+	
+// 2. ОТРЕСОВКА ГИЛЬЗ (3D КАПСУЛА НА ПОЛУ)
+	for (int i = 0; i < MAX_SHELLS; i++) {
+		if (!shells[i].active) continue;
+		float dx = shells[i].x - camX, dy = shells[i].y - camY;
+		float projDist = dx * dirX + dy * dirY;
+		if (projDist < 0.1f) continue;
 		
-	} // Конец цикла for (int y = 0; y < SH; y++)
-} // Конец функции RenderFrame
+		int px = (int)((SW / 2.0f) + (dx * (-dirY) + dy * dirX) / (projDist * planeLen) * (SW * 0.5f));
+		if (px < 0 || px >= SW) continue;
+		if (projDist > zbuf[px] + 0.1f) continue;
+		
+		float pureHorizon = (float)SH / 2.0f + rayDirZ * projPlane;
+		int py = (int)(pureHorizon - (shells[i].z - camZ) / projDist * projPlane + bobV);
+		
+		// Размер гильзы (горизонтально вытянутая)
+		float distFactor = 1.0f / (projDist * 0.25f + 1.0f);
+		int w = (int)(10.0f * distFactor); // Длина
+		int h = (int)(4.0f * distFactor);  // Толщина
+		if (w < 2) w = 2; if (w > 16) w = 16;
+		if (h < 1) h = 1; if (h > 6) h = 6;
+		
+		// Цвета (освещение сверху)
+		Color col_rim   = (Color){130, 90, 40, 255};   // Донышко (темное)
+		Color col_body  = (Color){190, 150, 60, 255};  // Латунь (основной)
+		Color col_shine = (Color){255, 230, 150, 255}; // Блик сверху
+		Color col_shade = (Color){110, 80, 30, 255};   // Тень снизу
+		
+		for (int sx_loop = px - w / 2; sx_loop <= px + w / 2; sx_loop++) {
+			if (sx_loop < 0 || sx_loop >= SW) continue;
+			
+			// Форма капсулы: сужается к правому краю (носик пули)
+			int current_h = h;
+			if (sx_loop > px + w / 4) current_h = h - 1; // Сужение справа
+			if (current_h < 1) current_h = 1;
+			
+			for (int sy = py - current_h / 2; sy <= py + current_h / 2; sy++) {
+				if (sy < 0 || sy >= SH) continue;
+				Color *row = pixels + sy * SW;
+				
+				Color c = col_body;
+				
+				// Левая часть (донышко)
+				if (sx_loop < px - w / 2 + 1) c = col_rim;
+				// Верхняя половина (блик от света)
+				else if (sy < py) c = col_shine;
+				// Нижняя половина (тень)
+				else if (sy > py) c = col_shade;
+				
+				row[sx_loop] = c;
+			}
+		}
+	}
+}
 
 // ------------------------------------------------------------
 //  СЕКТОР 12: МИНИ-КАРТА И MAIN
@@ -1866,6 +1760,7 @@ void DrawMiniMap(RenderTexture2D minimapRT) {
 			DrawRectangle(100 + mx * mmSize, 100 + my * mmSize, mmSize, mmSize, col);
 		}
 	}
+
 	
 	DrawCircle(100, 100, 4, RED);
 	DrawLine(100, 100,
@@ -1934,7 +1829,7 @@ int main(void) {
 	omp_set_num_threads(cpu_threads);
 #endif
 	
-	SetTargetFPS(144); 
+	SetTargetFPS(0); 
 	DisableCursor();
 	
 	while (!WindowShouldClose()) {
