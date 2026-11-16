@@ -15,14 +15,14 @@ int cpu_threads = 4;
 //  ОСНОВНЫЕ КОНСТАНТЫ
 // ------------------------------------------------------------
 
-#define MAX_PITCH 0.2f  
+#define MAX_PITCH 1.0f  
 #define SW 1080
 #define SH 720
 #define MW 192
 #define MH 192
 #define TS 32
-#define SKY_W 4024
-#define SKY_H 1072
+#define SKY_W 10000
+#define SKY_H 5000
 
 // Высоты (Потолки подняты, чтобы не застревать на ящиках)
 
@@ -119,6 +119,34 @@ typedef struct {
 
 Weapon pistol;
 
+// ------------------------------------------------------------
+//  СИСТЕМА СОСТОЯНИЙ И МЕНЮ
+// ------------------------------------------------------------
+typedef enum {
+	STATE_MENU,
+	STATE_TRANSITION,
+	STATE_PLAYING,
+} GameState;
+
+GameState currentState = STATE_MENU;
+int menuSelection = 0; 
+float transitionAlpha = 0.0f; 
+bool fadeToWhite = true;
+
+	// --- ГЛОБАЛЬНЫЕ ЗВУКИ И ТАЙМЕРЫ ---
+	Sound sndShellFloor;
+	Sound sndWallImpactBeton;
+	Sound sndWallImpactDerevo;
+	Sound sndWallImpactZhelezo;
+	Sound sndWallImpactPesok;
+	Sound sndFootstep;
+	Sound sndStaminaOut;
+	Sound sndStaminaBack;
+
+	float footstepTimer = 0.15f;
+	float shellSndCd = 0.0f;
+	bool isFullyExhausted = false;
+
 typedef struct {
 	float x, y, z;
 	float vx, vy, vz;
@@ -144,11 +172,22 @@ float fov       = 60.0f * (PI / 180.0f);
 float depth     = 64.0f;
 bool showMap = true;
 
+// Буферы для двухпроходного рендера (ВЫРАВНЕНЫ ПО 64 БАЙТАМ ДЛЯ OPENMP)
+__attribute__((aligned(64))) int rawStartBuf[SW], rawEndBuf[SW];
+__attribute__((aligned(64))) int   drawStartBuf[SW];
+__attribute__((aligned(64))) int   drawEndBuf[SW];
+__attribute__((aligned(64))) int   texIDBuf[SW];
+__attribute__((aligned(64))) int   txBuf[SW];
+__attribute__((aligned(64))) int   sideBuf[SW];
+__attribute__((aligned(64))) float perpBuf[SW];
+__attribute__((aligned(64))) float lightBuf[SW];
+__attribute__((aligned(64))) int   skyXBuf[SW];
+__attribute__((aligned(64))) int   topZBuf[SW];    
+__attribute__((aligned(64))) int   botZBuf[SW];    
+__attribute__((aligned(64))) int   shadeFloorBuf[SH];
+
 float zbuf[SW];
 
-// Буферы для двухпроходного рендера
-int rawStartBuf[SW], rawEndBuf[SW];
-int   drawStartBuf[SW];
 int   drawEndBuf[SW];
 int   texIDBuf[SW];
 int   txBuf[SW];
@@ -1178,10 +1217,7 @@ void SpawnBulletHole(float startX, float startY, float startZ, float dirX, float
 		float ceilZ = c->ceilZ;
 		float hitZ = startZ + dirZ * perpDist;
 		
-		// ЗАЩИТА: Если пуля летит выше потолка (в открытое небо) — убираем её без дырок
-		if (hitZ > Z_HIGHCEIL) {
-			return;
-		}
+		if (hitZ > Z_HIGHCEIL) return;
 		
 		// Попадание в пол
 		if (hitZ < floorZ && dirZ < 0.0f) {
@@ -1206,6 +1242,19 @@ void SpawnBulletHole(float startX, float startY, float startZ, float dirX, float
 			if (hitZ >= floorZ && hitZ <= ceilZ) {
 				float hitX = startX + dirX * perpDist;
 				float hitY = startY + dirY * perpDist;
+				
+				// ЗВУК ПОПАДАНИЯ ПО МАТЕРИАЛУ
+				int tex = c->wallTex;
+				Sound sndToPlay = sndWallImpactBeton;
+				
+				if (tex == 3) sndToPlay = sndWallImpactDerevo;
+				else if (tex == 4 || tex == 5) sndToPlay = sndWallImpactZhelezo;
+				else if (tex == 2) sndToPlay = sndWallImpactPesok;
+				
+				if (sndToPlay.frameCount > 0) {
+					SetSoundPitch(sndToPlay, 0.9f + (rand() % 21) / 100.0f);
+					PlaySound(sndToPlay);
+				}
 				
 				for (int i = 0; i < MAX_BULLETS; i++) {
 					if (!bulletHoles[i].active) {
@@ -1293,7 +1342,7 @@ void FireWeapon(void) {
 	}
 }
 
-void UpdateShells(float dt) {
+	void UpdateShells(float dt) {
 	for (int i = 0; i < MAX_SHELLS; i++) {
 		if (!shells[i].active) continue;
 		
@@ -1309,12 +1358,23 @@ void UpdateShells(float dt) {
 		float ny = shells[i].y + shells[i].vy * dt;
 		float nz = shells[i].z + shells[i].vz * dt;
 		
-		if (nz < Z_FLOOR + 0.02f) { 
-			nz = Z_FLOOR + 0.02f;
-			shells[i].vz = 0.0f; 
-			shells[i].vx = 0.0f; 
-			shells[i].vy = 0.0f;
-		}
+				if (nz < Z_FLOOR + 0.02f) { 
+					nz = Z_FLOOR + 0.02f;
+					
+					// Звук при касании пола
+					shellSndCd -= dt;
+					if (shells[i].vz < -0.5f && shellSndCd <= 0.0f) {
+						if (sndShellFloor.frameCount > 0) {
+							SetSoundPitch(sndShellFloor, 0.9f + (rand() % 21) / 100.0f);
+							PlaySound(sndShellFloor);
+							shellSndCd = 0.05f;
+						}
+					}
+					
+					shells[i].vz = 0.0f; 
+					shells[i].vx = 0.0f; 
+					shells[i].vy = 0.0f;
+				}
 		
 		int mapX = (int)floorf(nx);
 		int mapY = (int)floorf(ny);
@@ -1334,7 +1394,7 @@ void UpdateShells(float dt) {
 	}
 }
 
-void UpdatePlayer(float dt) {
+	void UpdatePlayer(float dt) {
 		Vector2 md = GetMouseDelta();
 	
 	// --- 1. ДВИГАЕМ ПРИЦЕЛ ВНУТРИ ЭКРАНА ---
@@ -1406,6 +1466,18 @@ void UpdatePlayer(float dt) {
 	if (isSprinting || player.stamina < player.maxStamina) {
 		stamina_ui_timer = 2.0f;
 	}
+		// --- ЗВУКИ СТАМИНЫ ---
+		// 1. Игрок выдохся до нуля (играем тяжелый выдох)
+		if (player.stamina <= 0.1f && !isFullyExhausted) {
+			if (sndStaminaOut.frameCount > 0) PlaySound(sndStaminaOut);
+			isFullyExhausted = true; // Запоминаем, что мы устали
+		}
+		
+		// 2. Игрок полностью восстановился (играем вдох)
+		if (player.stamina >= player.maxStamina - 0.1f && isFullyExhausted) {
+			if (sndStaminaBack.frameCount > 0) PlaySound(sndStaminaBack);
+			isFullyExhausted = false; // Сбрасываем усталость
+		}
 	
 	// --- ФИЗИКА ---
 	if (!isMoving && player.onGround) {
@@ -1468,7 +1540,29 @@ void UpdatePlayer(float dt) {
 	} else {
 		player.bobAmount += (0.0f - player.bobAmount) * dt * 6.0f;
 	}
-	
+
+// --- ЗВУК ШАГОВ ---
+		if (player.onGround && hs > 1.0f) {
+			footstepTimer -= dt; // Просто вычитаем время кадра
+			
+			if (footstepTimer <= 0.0f) {
+				if (sndFootstep.frameCount > 0) {
+					SetSoundPitch(sndFootstep, 0.9f + (rand() % 21) / 100.0f);
+					PlaySound(sndFootstep);
+				}
+				
+				// Задаем частоту шагов
+				if (isSprinting) {
+					footstepTimer = 0.28f; // При беге шаги звучат чаще
+				} else {
+					footstepTimer = 0.50f; // При ходьбе шаги звучат реже
+				}
+			}
+		} else {
+			// Если стоим на месте, сбрасываем таймер на 0.1 сек
+			footstepTimer = 0.1f; 
+		}
+
 	// --- СТРЕЛЬБА ---
 	if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) || IsKeyDown(KEY_LEFT_CONTROL)) {
 		FireWeapon();
@@ -1573,7 +1667,7 @@ void ApplyPS2Filter(Color *pixels) {
 	uint8_t noiseOffY = (uint8_t)(frameSeed >> 24);
 	
 	// 2. Многопоточный проход по строкам
-#pragma omp parallel for num_threads(cpu_threads) schedule(static)
+	#pragma omp parallel for num_threads(cpu_threads) schedule(static)
 	for (int y = 0; y < SH; y++) {
 		Color *row = pixels + y * SW;
 		Color srcRow[SW];
@@ -1645,7 +1739,6 @@ void RenderFrame(Color *pixels) {
 	float projPlane = (float)SH * 0.5f / tanf(fov * 0.5f);
 	float pitchOffset = tanf(player.pitch) * projPlane;
 	int horizon = (int)(SH / 2.0f + pitchOffset + bobV); 
-	float rayDirZ = tanf(player.pitch);
 	
 	// Луна
 	float moonAngle = 2.5f; 
@@ -1660,7 +1753,7 @@ void RenderFrame(Color *pixels) {
 	int moonR = 40;
 	
 	// ===== ПРОХОД 1: DDA (СТЕНЫ) =====
-#pragma omp parallel for num_threads(cpu_threads)
+	#pragma omp parallel for num_threads(cpu_threads) schedule(static)
 	for (int x = 0; x < SW; x++) {
 		float camXc = 2.0f * ((float)x / (float)SW) - 1.0f + bobH / (float)SW;
 		float rayDirX = dirX + planeX * camXc, rayDirY = dirY + planeY * camXc;
@@ -1974,35 +2067,142 @@ void DrawMiniMap(RenderTexture2D minimapRT) {
 	if (!showMap) return;
 	
 	BeginTextureMode(minimapRT);
-	ClearBackground(BLACK);
+	// Делаем фон полностью прозрачным (BLANK), чтобы квадрат миникарты не перекрывал игру
+	ClearBackground(BLANK); 
 	
-	int mmSize = 4;
+	int centerX = 100;
+	int centerY = 100;
+	int radius = 80; // Радиус нашего радара
+	int mmSize = 5;
 	int curCellX = (int)player.x;
 	int curCellY = (int)player.y;
 	
-	for (int mx = -25; mx < 25; mx++) {
-		for (int my = -25; my < 25; my++) {
+	// 1. РИСУЕМ КАРТУ (Только внутри круга)
+	for (int mx = -20; mx <= 20; mx++) {
+		for (int my = -20; my <= 20; my++) {
 			int cx = curCellX + mx;
 			int cy = curCellY + my;
 			if (cx < 0 || cx >= MW || cy < 0 || cy >= MH) continue;
 			
 			Cell *c = &map[cx][cy];
-			Color col = BLANK;
-			if (c->type == CELL_WALL)         col = (Color){120, 100, 70, 255};
-			else if (c->type == CELL_CRATE)   col = (Color){150, 100, 50, 255};
-			else                              col = (Color){200, 180, 140, 80};
+			if (c->type == CELL_EMPTY) continue; 
 			
-			DrawRectangle(100 + mx * mmSize, 100 + my * mmSize, mmSize, mmSize, col);
+			// Вычисляем расстояние от центра, чтобы обрезать карту по кругу
+			float dx = mx * mmSize;
+			float dy = my * mmSize;
+			if (dx * dx + dy * dy > radius * radius) continue; // Если за пределами круга — пропускаем
+			
+			// Темно-коричневые стены, чуть светлее ящики
+			Color col = (Color){35, 30, 25, 255};
+			if (c->type == CELL_CRATE) col = (Color){60, 45, 30, 255};
+			
+			DrawRectangle(centerX + (int)dx - (mmSize/2), centerY + (int)dy - (mmSize/2), mmSize, mmSize, col);
 		}
 	}
-
 	
-	DrawCircle(100, 100, 4, RED);
-	DrawLine(100, 100,
-			 100 + (int)(cosf(player.pa) * 15),
-			 100 + (int)(sinf(player.pa) * 15), RED);
+	// 2. ЗАТЕНЕНИЕ ПО КРАЯМ (Эффект линзы/радара)
+	// Рисуем темные полупрозрачные круги поверх краев карты, чтобы она растворялась в темноте
+	DrawRing((Vector2){centerX, centerY}, radius - 15, radius, 0, 360, 36, Fade(BLACK, 0.6f));
+	DrawRing((Vector2){centerX, centerY}, radius - 5, radius, 0, 360, 36, Fade(BLACK, 0.8f));
+	
+	// 3. МЕТАЛЛИЧЕСКОЕ КОЛЬЦО (Внешний корпус)
+	Color ringColor = (Color){80, 70, 50, 255}; // Грязно-латунный цвет
+	// Внешний обод
+	DrawRing((Vector2){centerX, centerY}, radius, radius + 6, 0, 360, 36, ringColor);
+	// Внутренняя тонкая линия
+	DrawRing((Vector2){centerX, centerY}, radius - 1, radius, 0, 360, 36, (Color){20, 20, 15, 255});
+	
+	// 4. НАСЕЧКИ (Как на компасе)
+	for (int i = 0; i < 360; i += 15) {
+		float angle = i * DEG2RAD;
+		float x1 = centerX + cosf(angle) * (radius + 2);
+		float y1 = centerY + sinf(angle) * (radius + 2);
+		float x2 = centerX + cosf(angle) * (radius + 6);
+		float y2 = centerY + sinf(angle) * (radius + 6);
+		
+		// Каждая 4-я насечка (каждые 60 градусов) — длиннее и ярче
+		if (i % 60 == 0) {
+			x1 = centerX + cosf(angle) * radius;
+			DrawLine((int)x1, (int)y1, (int)x2, (int)y2, (Color){180, 160, 120, 255});
+		} else {
+			DrawLine((int)x1, (int)y1, (int)x2, (int)y2, (Color){100, 90, 70, 200});
+		}
+	}
+	
+	// 5. ПОТЁРТОСТИ И ЦАРАПИНЫ
+	// Рисуем несколько случайных линий поверх кольца (используем фиксированные координаты, чтобы не мерцало)
+	Color scratchColor = (Color){30, 25, 15, 150};
+	DrawLine(centerX - 70, centerY - 45, centerX - 80, centerY - 55, scratchColor); // Царапина сверху-слева
+	DrawLine(centerX + 60, centerY + 60, centerX + 75, centerY + 50, scratchColor);  // Царапина снизу-справа
+	DrawLine(centerX + 82, centerY - 10, centerX + 85, centerY - 20, scratchColor);  // Справа
+	DrawCircle(centerX - 40, centerY + 75, 2, (Color){20, 20, 10, 200}); // Пятно/скол
+	DrawCircle(centerX + 45, centerY - 65, 1.5f, (Color){20, 20, 10, 200}); // Ещё скол
+	
+	// 6. МАРКЕР ИГРОКА (В центре)
+	// Бледно-желтая точка
+	DrawCircle(centerX, centerY, 3, (Color){220, 200, 150, 255});
+	
+	// Указатель направления взгляда (в виде треугольника/стрелки)
+	float viewLength = 15.0f;
+	float coneWidth = 4.0f;
+	float lookX = centerX + cosf(player.pa) * viewLength;
+	float lookY = centerY + sinf(player.pa) * viewLength;
+	
+	// Линия направления
+	DrawLine(centerX, centerY, (int)lookX, (int)lookY, (Color){220, 200, 150, 255});
+	
+	// Верхушка стрелки (чтобы было видно, куда именно смотрит игрок)
+	float perpAngle = player.pa + PI/2;
+	int tipX1 = (int)(lookX + cosf(perpAngle) * coneWidth);
+	int tipY1 = (int)(lookY + sinf(perpAngle) * coneWidth);
+	int tipX2 = (int)(lookX - cosf(perpAngle) * coneWidth);
+	int tipY2 = (int)(lookY - sinf(perpAngle) * coneWidth);
+	DrawTriangle((Vector2){(float)lookX, (float)lookY}, (Vector2){(float)tipX1, (float)tipY1}, (Vector2){(float)tipX2, (float)tipY2}, (Color){220, 200, 150, 255});
 	
 	EndTextureMode();
+}
+
+void DrawMainMenu(void) {
+	ClearBackground((Color){15, 15, 15, 255}); // Почти черный фон
+	
+	// Заголовок
+	const char* title = "BATTLE SIMULATION";
+	int titleSize = 60;
+	int titleWidth = MeasureText(title, titleSize);
+	int titleX = SW/2 - titleWidth/2;
+	int titleY = SH/3;
+	
+	// Тень для текста (эффект старого монитора)
+	DrawText(title, titleX + 3, titleY + 3, titleSize, (Color){50, 45, 30, 255});
+	DrawText(title, titleX, titleY, titleSize, (Color){220, 200, 150, 255}); // Желтоватый текст
+	
+	const char* subtitle = "in hard times";
+	int subWidth = MeasureText(subtitle, 20);
+	DrawText(subtitle, SW/2 - subWidth/2, titleY + 70, 20, (Color){150, 140, 110, 255});
+	
+	// Кнопки
+	const char* playText = "PLAY";
+	const char* exitText = "EXIT";
+	int playWidth = MeasureText(playText, 40);
+	int exitWidth = MeasureText(exitText, 40);
+	
+	int playY = SH/2 + 50;
+	int exitY = SH/2 + 130;
+	
+	// Кнопка PLAY
+	Color playColor = (menuSelection == 0) ? (Color){255, 230, 150, 255} : (Color){80, 75, 60, 255};
+	DrawText(playText, SW/2 - playWidth/2, playY, 40, playColor);
+	if (menuSelection == 0) DrawText(">", SW/2 - playWidth/2 - 40, playY, 40, playColor);
+	
+	// Кнопка EXIT
+	Color exitColor = (menuSelection == 1) ? (Color){255, 230, 150, 255} : (Color){80, 75, 60, 255};
+	DrawText(exitText, SW/2 - exitWidth/2, exitY, 40, exitColor);
+	if (menuSelection == 1) DrawText(">", SW/2 - exitWidth/2 - 40, exitY, 40, exitColor);
+	
+	// Подсказка внизу
+	const char* hint = "W / S - NAVIGATE   |   ENTER - SELECT";
+	int hintWidth = MeasureText(hint, 15);
+	DrawText(hint, SW/2 - hintWidth/2, SH - 50, 15, (Color){60, 60, 60, 255});
 }
 
 // ------------------------------------------------------------
@@ -2102,12 +2302,6 @@ int main(void) {
 	pistol.texFire3  = LoadTexture("pistol_anim/glock_fire3.png");
 	pistol.texReload = LoadTexture("pistol_anim/glock_reload.png");
 	
-	if (pistol.texIdle.id == 0) {
-		TraceLog(LOG_WARNING, "ОШИБКА: Файлы не найдены в папке pistol_anim!");
-	} else {
-		TraceLog(LOG_INFO, "УСПЕХ: Спрайты пистолета загружены!");
-	}
-	
 	pistol.currentFrame = 0;
 	pistol.animTimer = 0.0f;
 	
@@ -2121,12 +2315,27 @@ int main(void) {
 	pistol.sndReloadEnd   = LoadSound("soundfiles/reload_pistol_end.mp3");
 	pistol.sndEmpty       = LoadSound("soundfiles/nobullets_pistol.mp3");
 	
-	SetSoundVolume(pistol.sndShot, 1.0f);
+	sndShellFloor        = LoadSound("soundfiles/gilza_padaet.mp3");
+	sndWallImpactBeton   = LoadSound("soundfiles/shot_beton.mp3");
+	sndWallImpactDerevo  = LoadSound("soundfiles/shot_derevo.mp3");
+	sndWallImpactZhelezo = LoadSound("soundfiles/shot_zhelezo.mp3");
+	sndWallImpactPesok   = LoadSound("soundfiles/shot_pesok.mp3");
+	sndFootstep          = LoadSound("soundfiles/step.mp3");
+	sndStaminaOut        = LoadSound("soundfiles/odyshka.mp3");
+	sndStaminaBack       = LoadSound("soundfiles/vostanovlenie_dyhaniya.mp3");
+	
+	SetSoundVolume(sndShellFloor, 0.8f);
+	SetSoundVolume(sndWallImpactBeton, 0.8f);
+	SetSoundVolume(sndWallImpactDerevo, 0.8f);
+	SetSoundVolume(sndWallImpactZhelezo, 0.8f);
+	SetSoundVolume(sndWallImpactPesok, 0.8f);
+	SetSoundVolume(sndFootstep, 0.04f);
+	SetSoundVolume(sndStaminaOut, 0.8f);
+	SetSoundVolume(sndStaminaBack, 0.1f);	
+	SetSoundVolume(pistol.sndShot, 0.7f);
 	SetSoundVolume(pistol.sndReloadStart, 1.0f);
 	SetSoundVolume(pistol.sndReloadEnd, 1.0f);
-	SetSoundVolume(pistol.sndEmpty, 1.0f);
-	
-	if (pistol.sndShot.frameCount == 0) TraceLog(LOG_WARNING, "Звук shot_pistol.mp3 не найден!");
+	SetSoundVolume(pistol.sndEmpty, 1.2f);
 	
 	Image renderBuffer = GenImageColor(SW, SH, BLACK);
 	Color *pixels = (Color *)renderBuffer.data;
@@ -2135,7 +2344,6 @@ int main(void) {
 	RenderTexture2D minimapRT = LoadRenderTexture(200, 200);
 	int minimapTick = 0;
 	
-	// --- ИНИЦИАЛИЗАЦИЯ БУФЕРА ПОСТ-ОБРАБОТКИ И ШЕЙДЕРА ---
 	RenderTexture2D postRT = LoadRenderTexture(SW, SH);
 	Shader ps2Shader = LoadShaderFromMemory(NULL, ps2FragmentShader);
 	int locTime = GetShaderLocation(ps2Shader, "uTime");
@@ -2147,140 +2355,263 @@ int main(void) {
 #ifdef _OPENMP
 	detected_procs = omp_get_num_procs();
 #endif
-	cpu_threads = detected_procs;
-	if (cpu_threads < 4) cpu_threads = 4; 
-	if (cpu_threads > 16) cpu_threads = 16;
+	cpu_threads = detected_procs - 1; 
+	if (cpu_threads < 2) cpu_threads = 2; 
+	if (cpu_threads > 8) cpu_threads = 8; 
 #ifdef _OPENMP
 	omp_set_num_threads(cpu_threads);
 #endif
 	
 	SetTargetFPS(0); 
-	DisableCursor();
+	EnableCursor(); // Мышка для меню
 	
 	while (!WindowShouldClose()) {
 		float dt = GetFrameTime();
 		if (dt > 0.05f) dt = 0.05f;
 		
 		if (hasMusic) UpdateMusicStream(music);
-		UpdatePlayer(dt);
-		RenderFrame(pixels);
-		// ApplyPS2Filter(pixels); <-- УБРАНО: теперь фильтр делает видеокарта
-		UpdateTexture(screenTexture, pixels);
 		
-		// --- ОБНОВЛЕНИЕ ТАЙМЕРОВ ИНТЕРФЕЙСА ---
-		if (volume_ui_timer > 0.0f) volume_ui_timer -= dt;
-		if (stamina_ui_timer > 0.0f) stamina_ui_timer -= dt;
-		
-		// --- УПРАВЛЕНИЕ ГРОМКОСТЬЮ ---
-		if (IsKeyDown(KEY_LEFT_BRACKET)) { music_volume -= 0.5f * dt; if (music_volume < 0.0f) music_volume = 0.0f; volume_ui_timer = 2.0f; }
-		if (IsKeyDown(KEY_RIGHT_BRACKET)) { music_volume += 0.5f * dt; if (music_volume > 1.0f) music_volume = 1.0f; volume_ui_timer = 2.0f; }
-		if (hasMusic) SetMusicVolume(music, music_volume);
-		
-		// --- МИНИ-КАРТА (обновление текстуры) ---
-		if (showMap && (++minimapTick >= 10)) { 
-			minimapTick = 0; 
-			DrawMiniMap(minimapRT); 
+		// ============================================================
+		// 1. ЛОГИКА (МЕНЮ, ПЕРЕХОД, ИГРА, ПАУЗА)
+		// ============================================================
+		if (currentState == STATE_MENU) {
+			if (IsKeyPressed(KEY_W) || IsKeyPressed(KEY_UP)) menuSelection--;
+			if (IsKeyPressed(KEY_S) || IsKeyPressed(KEY_DOWN)) menuSelection++;
+			if (menuSelection < 0) menuSelection = 1;
+			if (menuSelection > 1) menuSelection = 0;
+			
+			if (IsKeyPressed(KEY_ENTER)) {
+				if (menuSelection == 0) {
+					currentState = STATE_TRANSITION;
+					fadeToWhite = true;
+					transitionAlpha = 0.0f;
+				} else if (menuSelection == 1) {
+					break; 
+				}
+			}
+		} 
+		else if (currentState == STATE_TRANSITION) {
+			if (fadeToWhite) {
+				transitionAlpha += dt * 1.0f; // Плавное затухание в белый (1 секунда)
+				if (transitionAlpha >= 1.0f) {
+					transitionAlpha = 1.0f;
+					fadeToWhite = false;
+					DisableCursor(); 
+				}
+			} else {
+				transitionAlpha -= dt * 0.6f; // Медленное проявление (около 1.6 секунды)
+				if (transitionAlpha <= 0.0f) {
+					transitionAlpha = 0.0f;
+					currentState = STATE_PLAYING;
+				}
+			}
 		}
 		
-		// ============================================================
-		// 1. РИСУЕМ 3D-МИР И PNG-ПИСТОЛЕТ В ОБЩИЙ БУФЕР postRT
-		// ============================================================
-		BeginTextureMode(postRT);
-		ClearBackground(BLACK);
-		DrawTexture(screenTexture, 0, 0, WHITE);
-		
-		// --- СПРАЙТ ПИСТОЛЕТА (теперь внутри postRT, попадет под фильтр) ---
-		Texture2D currentTex = pistol.texIdle; 
-		if (pistol.isReloading) currentTex = pistol.texReload;
-		else if (pistol.currentFrame == 1) currentTex = pistol.texFire1;
-		else if (pistol.currentFrame == 2) currentTex = pistol.texFire2;
-		else if (pistol.currentFrame == 3) currentTex = pistol.texFire3;
-		
-		if (currentTex.id > 0) {
-			float scale = 0.4f;
-			int offsetX = 50;
-			int offsetY = 0;
-			
-			int gunX = SW - (int)(currentTex.width * scale) - offsetX + (int)(player.crosshairX * 0.5f);
-			int gunY = SH - (int)(currentTex.height * scale) + offsetY + (int)(player.crosshairY * 0.5f); 
-			
-			int recoilOffset = (int)(pistol.recoil * 40.0f);
-			if (pistol.isReloading) {
-				float reloadProgress = 1.0f - (pistol.reloadTimer / pistol.reloadTime);
-				recoilOffset += (int)(sinf(reloadProgress * PI) * 200.0f); 
+		else if (currentState == STATE_PLAYING) {
+			// Если нажали ESC — мгновенно выходим в главное меню
+			if (IsKeyPressed(KEY_ESCAPE)) {
+				currentState = STATE_MENU;
+				EnableCursor();
+				GenMap(); // Сбрасываем карту и игрока
 			}
 			
-			DrawTextureEx(currentTex, (Vector2){ (float)gunX, (float)(gunY + recoilOffset) }, 0.0f, scale, WHITE);
+		UpdatePlayer(dt); 
+			
+			if (volume_ui_timer > 0.0f) volume_ui_timer -= dt;
+			if (stamina_ui_timer > 0.0f) stamina_ui_timer -= dt;
+			if (IsKeyDown(KEY_LEFT_BRACKET)) { music_volume -= 0.5f * dt; if (music_volume < 0.0f) music_volume = 0.0f; volume_ui_timer = 2.0f; }
+			if (IsKeyDown(KEY_RIGHT_BRACKET)) { music_volume += 0.5f * dt; if (music_volume > 1.0f) music_volume = 1.0f; volume_ui_timer = 2.0f; }
+			if (hasMusic) SetMusicVolume(music, music_volume);
 		}
-		EndTextureMode();
 		
 		// ============================================================
-		// 2. ВЫВОДИМ postRT НА ЭКРАН ЧЕРЕЗ PS2-ШЕЙДЕР + HUD ПОВЕРХ
+		// 2. РЕНДЕР 3D МИРА
 		// ============================================================
-		float nowTime = (float)GetTime();
-		SetShaderValue(ps2Shader, locTime, &nowTime, SHADER_UNIFORM_FLOAT);
+		// Рендерим 3D мир ТОЛЬКО когда мы в игре, на паузе, 
+		// ИЛИ когда белый экран уже пошёл на спад (чтобы не было видно игру сквозь меню)
+		bool need3DWorld = (currentState == STATE_PLAYING || (currentState == STATE_TRANSITION && !fadeToWhite));
 		
+		if (need3DWorld) {
+			RenderFrame(pixels);
+			UpdateTexture(screenTexture, pixels);
+			
+			if (showMap && (++minimapTick >= 10)) { minimapTick = 0; DrawMiniMap(minimapRT); }
+			
+			BeginTextureMode(postRT);
+			ClearBackground(BLACK);
+			DrawTexture(screenTexture, 0, 0, WHITE);
+			
+			// --- СПРАЙТ ПИСТОЛЕТА ---
+			Texture2D currentTex = pistol.texIdle; 
+			if (pistol.isReloading) currentTex = pistol.texReload;
+			else if (pistol.currentFrame == 1) currentTex = pistol.texFire1;
+			else if (pistol.currentFrame == 2) currentTex = pistol.texFire2;
+			else if (pistol.currentFrame == 3) currentTex = pistol.texFire3;
+			
+			if (currentTex.id > 0) {
+				float scale = 0.4f;
+				int offsetX = 50;
+				int offsetY = 0;
+				int gunX = SW - (int)(currentTex.width * scale) - offsetX + (int)(player.crosshairX * 0.5f);
+				int gunY = SH - (int)(currentTex.height * scale) + offsetY + (int)(player.crosshairY * 0.5f); 
+				int recoilOffset = (int)(pistol.recoil * 40.0f);
+				if (pistol.isReloading) {
+					float reloadProgress = 1.0f - (pistol.reloadTimer / pistol.reloadTime);
+					recoilOffset += (int)(sinf(reloadProgress * PI) * 200.0f); 
+				}
+				DrawTextureEx(currentTex, (Vector2){ (float)gunX, (float)(gunY + recoilOffset) }, 0.0f, scale, WHITE);
+			}
+			EndTextureMode();
+		}
+		
+		// ============================================================
+		// 3. ВЫВОД НА ЭКРАН
+		// ============================================================
 		BeginDrawing();
 		ClearBackground(BLACK);
 		
-		BeginShaderMode(ps2Shader);
-		DrawTextureRec(postRT.texture, (Rectangle){0, 0, (float)SW, (float)-SH}, (Vector2){0, 0}, WHITE);
-		EndShaderMode();
-		
-		// --- МИНИ-КАРТА ---
-		if (showMap) {
-			DrawTextureRec(minimapRT.texture, (Rectangle){0, 0, 200, -200}, (Vector2){SW - 220, 20}, WHITE);
-		}
-		
-		// --- ШКАЛА ГРОМКОСТИ ---
-		if (volume_ui_timer > 0.0f) {
-			DrawRectangle(20, SH - 40, 200, 20, Fade(BLACK, 0.5f));
-			DrawRectangle(25, SH - 35, (int)(190 * music_volume), 10, BLUE);
-			DrawText(TextFormat("Vol: %d%% ([ / ])", (int)(music_volume * 100)), 25, SH - 55, 12, WHITE);
-		}
-		
-		// --- ШКАЛА СТАМИНЫ ---
-		if (stamina_ui_timer > 0.0f) {
-			int stX = SW / 2 - 150;
-			int stY = SH / 2 + 180; 
+		// Если мы в меню ИЛИ в первой фазе перехода (затухание в белый) — рисуем МЕНЮ
+		if (currentState == STATE_MENU || (currentState == STATE_TRANSITION && fadeToWhite)) {
+			DrawMainMenu();
+		} 
+		// Иначе (игра, пауза, или вторая фаза перехода) — рисуем ИГРУ
+		else {
+			float nowTime = (float)GetTime();
+			SetShaderValue(ps2Shader, locTime, &nowTime, SHADER_UNIFORM_FLOAT);
 			
-			DrawRectangle(stX, stY, 300, 20, Fade(BLACK, 0.5f));
-			Color stamCol = (player.stamina > 30.0f) ? GREEN : RED;
-			DrawRectangle(stX + 5, stY + 5, (int)(290.0f * (player.stamina / player.maxStamina)), 10, stamCol);
-			DrawText(TextFormat("Stamina: %d%%", (int)player.stamina), stX + 5, stY - 15, 12, WHITE);
-		}
-		
-		// --- HUD (ВЕРХНЯЯ ЧАСТЬ) ---
-		DrawText("WASD: Move / SPACE: Jump / SHIFT: Sprint", 20, 20, 16, RAYWHITE);
-		DrawText("[ / ]: Volume  M: Map", 20, 40, 16, GRAY);
-		DrawText(TextFormat("Pos: X=%.1f Y=%.1f Z=%.1f", player.x, player.y, player.z), 20, 85, 16, YELLOW);
-		DrawText(TextFormat("Speed: %.1f u/s", sqrtf(player.vx * player.vx + player.vy * player.vy)), 20, 105, 16, GREEN);
-		DrawText(TextFormat("Ammo: %d / %d [R]", pistol.ammo, pistol.maxAmmo), 20, 125, 16, RAYWHITE);
-		DrawFPS(20, 65);
-		
-		// --- HUD ПЕРЕЗАРЯДКИ ---
-		if (pistol.isReloading) {
-			int cx = SW / 2;
-			int cy = SH / 2;
-			float progress = 1.0f - (pistol.reloadTimer / pistol.reloadTime);
+			BeginShaderMode(ps2Shader);
+			DrawTextureRec(postRT.texture, (Rectangle){0, 0, (float)SW, (float)-SH}, (Vector2){0, 0}, WHITE);
+			EndShaderMode();
 			
-			DrawCircle(cx, cy + 50, 30, Fade(BLACK, 0.6f));
-			DrawCircle(cx, cy + 50, 25, Fade(RAYWHITE, 0.8f));
-			DrawRing((Vector2){cx, cy + 50}, 20, 28, 0, 360.0f * progress, 32, GREEN);
-			DrawText("RELOADING", cx - 50, cy + 90, 20, RAYWHITE);
+			// HUD
+			if (currentState == STATE_PLAYING) {
+				
+				if (showMap) {
+					DrawTextureRec(minimapRT.texture, (Rectangle){0, 0, 200, -200}, (Vector2){SW - 220, 20}, WHITE);
+				}
+				
+				if (volume_ui_timer > 0.0f) {
+					DrawRectangle(20, SH - 40, 200, 20, Fade(BLACK, 0.5f));
+					DrawRectangle(25, SH - 35, (int)(190 * music_volume), 10, BLUE);
+					DrawText(TextFormat("Vol: %d%% ([ / ])", (int)(music_volume * 100)), 25, SH - 55, 12, WHITE);
+				}
+				
+				// --- ПАТРОНЫ ---
+				int magX = SW - 50;
+				int magBottomY = SH - 40;
+				int magHeight = 140;
+				int magWidth = 28;
+				float magYOffset = 0.0f;
+				bool magIsFull = false;
+				
+				if (pistol.isReloading) {
+					float rp = 1.0f - (pistol.reloadTimer / pistol.reloadTime);
+					if (rp < 0.40f) {
+						float t = rp / 0.40f;
+						magYOffset = (t * t) * 380.0f;
+					} else if (rp > 0.60f) {
+						float t = (rp - 0.60f) / 0.40f;
+						float ease = 1.0f - t;
+						magYOffset = (ease * ease) * 380.0f;
+						magIsFull = true;
+					} else {
+						magYOffset = 380.0f;
+					}
+				}
+				
+				int actualMagY = magBottomY + (int)magYOffset;
+				DrawText("AMMO", magX, magBottomY - magHeight - 18, 10, (Color){150, 130, 90, 200});
+				
+				if (actualMagY < SH + magHeight) {
+					DrawRectangle(magX, actualMagY - magHeight, magWidth, magHeight, (Color){10, 10, 10, 200});
+					DrawRectangleLines(magX, actualMagY - magHeight, magWidth, magHeight, (Color){100, 85, 60, 220});
+					float bulletH = (float)magHeight / pistol.maxAmmo;
+					for (int i = 0; i < pistol.maxAmmo; i++) {
+						int y = actualMagY - (int)((i + 1) * bulletH);
+						bool isLoaded = magIsFull || (i < pistol.ammo);
+						Color col = isLoaded ? (Color){220, 195, 70, 255} : (Color){35, 35, 35, 150};
+						DrawRectangle(magX + 4, y + 2, magWidth - 8, (int)bulletH - 3, col);
+					}
+				}
+				
+				// --- ПЕРЕЗАРЯДКА ---
+				int indX = magX - 75;
+				int indY = magBottomY - 50;
+				float circleAlpha = 0.0f;
+				float numberAlpha = 1.0f;
+				
+				if (pistol.isReloading) {
+					float rp = 1.0f - (pistol.reloadTimer / pistol.reloadTime);
+					if (rp < 0.05f) {
+						float t = rp / 0.05f; t = t * t * (3.0f - 2.0f * t);
+						circleAlpha = t; numberAlpha = 1.0f - t;
+					} else if (rp < 0.82f) {
+						circleAlpha = 1.0f; numberAlpha = 0.0f;
+					} else if (rp < 0.92f) {
+						float t = (rp - 0.82f) / 0.10f; t = t * t * (3.0f - 2.0f * t);
+						circleAlpha = 1.0f - t; numberAlpha = 0.0f;
+					} else {
+						float t = (rp - 0.92f) / 0.08f; t = t * t * (3.0f - 2.0f * t);
+						circleAlpha = 0.0f; numberAlpha = t;
+					}
+				}
+				
+				if (circleAlpha > 0.01f) {
+					float rp = 1.0f - (pistol.reloadTimer / pistol.reloadTime);
+					int indR = 35;
+					Color bg = (Color){10, 10, 10, (unsigned char)(200 * circleAlpha)};
+					Color border = (Color){100, 85, 60, (unsigned char)(220 * circleAlpha)};
+					Color fill = (Color){200, 170, 60, (unsigned char)(255 * circleAlpha)};
+					Color label = (Color){150, 130, 90, (unsigned char)(220 * circleAlpha)};
+					
+					DrawCircle(indX, indY, indR, bg);
+					DrawCircleLines(indX, indY, indR, border);
+					int fillAngle = (int)(360.0f * rp);
+					if (fillAngle > 0) DrawCircleSector((Vector2){indX, indY}, indR - 3, -90.0f, -90.0f + fillAngle, 32, fill);
+					DrawText("RELOAD", indX - 24, indY + indR + 8, 11, label);
+				}
+				
+				if (numberAlpha > 0.01f) {
+					int ammoToShow = pistol.isReloading ? pistol.maxAmmo : pistol.ammo;
+					unsigned char a1 = (unsigned char)(255 * numberAlpha);
+					unsigned char a2 = (unsigned char)(220 * numberAlpha);
+					DrawText(TextFormat("%d", ammoToShow), magX - 95, magBottomY - 70, 64, (Color){250, 230, 170, a1});
+					DrawText(TextFormat("/%d", pistol.maxAmmo), magX - 55, magBottomY - 18, 18, (Color){150, 120, 80, a2});
+				}
+				
+				// --- СТАМИНА ---
+				if (stamina_ui_timer > 0.0f) {
+					int stW = 200, stH = 6;
+					int stX = SW / 2 - stW / 2;
+					int stY = SH - 30;
+					DrawRectangle(stX, stY, stW, stH, Fade(BLACK, 0.7f));
+					float staminaPercent = player.stamina / player.maxStamina;
+					int fillW = (int)(stW * staminaPercent);
+					Color stCol;
+					if (staminaPercent > 0.6f) stCol = (Color){80, 200, 80, 255};
+					else if (staminaPercent > 0.3f) stCol = (Color){220, 180, 60, 255};
+					else stCol = (Color){220, 80, 60, 255};
+					DrawRectangle(stX, stY, fillW, stH, stCol);
+				}
+				
+				// --- ПРИЦЕЛ ---
+				int cx = SW / 2 + (int)player.crosshairX;
+				int cy = SH / 2 + (int)player.crosshairY;
+				Color chColor = (Color){255, 255, 255, 220}; 
+				DrawLine(cx, cy - 3, cx, cy + 3, chColor);
+				int gapX = 12, gapY = 4, len = 4;
+				DrawLine(cx - gapX, cy - gapY, cx - gapX, cy + gapY, chColor);
+				DrawLine(cx - gapX, cy - gapY, cx - gapX - len, cy - gapY, chColor);
+				DrawLine(cx + gapX, cy - gapY, cx + gapX, cy + gapY, chColor);
+				DrawLine(cx + gapX, cy - gapY, cx + gapX + len, cy - gapY, chColor);
+			}
+			
+			// БЕЛАЯ ВСПЫШКА
+			if (currentState == STATE_TRANSITION) {
+				DrawRectangle(0, 0, SW, SH, Fade(WHITE, transitionAlpha));
+			}
 		}
 		
-		// --- ПРИЦЕЛ ---
-		int cx = SW / 2 + (int)player.crosshairX;
-		int cy = SH / 2 + (int)player.crosshairY;
-		Color chColor = (Color){255, 255, 255, 220}; 
-		
-		DrawLine(cx, cy - 3, cx, cy + 3, chColor);
-		int gapX = 12, gapY = 4, len = 4;
-		DrawLine(cx - gapX, cy - gapY, cx - gapX, cy + gapY, chColor);
-		DrawLine(cx - gapX, cy - gapY, cx - gapX - len, cy - gapY, chColor);
-		DrawLine(cx + gapX, cy - gapY, cx + gapX, cy + gapY, chColor);
-		DrawLine(cx + gapX, cy - gapY, cx + gapX + len, cy - gapY, chColor);
 		EndDrawing();
 	}
 	
@@ -2290,6 +2621,14 @@ int main(void) {
 	if (pistol.texFire2.id > 0)  UnloadTexture(pistol.texFire2);
 	if (pistol.texFire3.id > 0)  UnloadTexture(pistol.texFire3);
 	if (pistol.texReload.id > 0) UnloadTexture(pistol.texReload);
+	if (sndShellFloor.frameCount > 0) UnloadSound(sndShellFloor);
+	if (sndWallImpactBeton.frameCount > 0) UnloadSound(sndWallImpactBeton);
+	if (sndWallImpactDerevo.frameCount > 0) UnloadSound(sndWallImpactDerevo);
+	if (sndWallImpactZhelezo.frameCount > 0) UnloadSound(sndWallImpactZhelezo);
+	if (sndWallImpactPesok.frameCount > 0) UnloadSound(sndWallImpactPesok);
+	if (sndFootstep.frameCount > 0) UnloadSound(sndFootstep);
+	if (sndStaminaOut.frameCount > 0) UnloadSound(sndStaminaOut);
+	if (sndStaminaBack.frameCount > 0) UnloadSound(sndStaminaBack);
 	
 	UnloadShader(ps2Shader);
 	UnloadRenderTexture(postRT);
@@ -2301,4 +2640,3 @@ int main(void) {
 	CloseWindow();
 	return 0;
 }
-
