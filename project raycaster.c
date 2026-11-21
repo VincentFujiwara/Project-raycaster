@@ -22,6 +22,9 @@ typedef struct tagMSG MSG, *LPMSG;
 #include <stdbool.h>
 #include <string.h>
 #include <time.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 	
 int cpu_threads = 4;
 
@@ -35,8 +38,8 @@ int cpu_threads = 4;
 #define MW 192
 #define MH 192
 #define TS 256
-#define SKY_W 10000
-#define SKY_H 5000
+#define SKY_W 4096
+#define SKY_H 2048
 
 // Высоты (Потолки подняты, чтобы не застревать на ящиках)
 
@@ -101,6 +104,7 @@ typedef struct {
 	float vx, vy, vz;
 	float life;
 	bool active;
+	bool isMagazine; // grey rectangle on reload instead of brass shell
 } Shell;
 
 Shell shells[MAX_SHELLS];
@@ -200,6 +204,8 @@ typedef struct {
 	int health;
 	int faceID;
 	bool isDead;
+	int kills;
+	int deaths;
 } NetworkPlayer;
 
 typedef enum {
@@ -209,6 +215,8 @@ typedef enum {
 	PKT_STATE_UPDATE,
 	PKT_SHOOT,
 	PKT_HIT,
+	PKT_KILL,
+	PKT_CHAT,
 	PKT_DISCONNECT
 } PacketType;
 
@@ -218,6 +226,7 @@ typedef struct {
 	NetworkPlayer playerData;
 	int targetID;
 	int damage;
+	char message[128];
 } NetworkPacket;
 #pragma pack(pop)
 
@@ -237,7 +246,73 @@ bool typingIP = false;
 char discoveredServersIPs[10][32];
 int discoveredServerNums[10];
 bool showTabMenu = false;
+bool showKeyHints = true;
+bool showChatInput = false;
+char chatInput[128] = "";
+#define MAX_CHAT_LINES 10
+#define MAX_KILL_LINES 6
+char chatLines[MAX_CHAT_LINES][192];
+float chatLineTimes[MAX_CHAT_LINES];
+char killLines[MAX_KILL_LINES][96];
+float killLineTimes[MAX_KILL_LINES];
+bool netActive[MAX_NET_PLAYERS];
+float lastHeard[MAX_NET_PLAYERS];
+float deathAnimStart[MAX_NET_PLAYERS];
+bool deathAnimPending[MAX_NET_PLAYERS];
 float respawnTimer = 0.0f;
+float deathFlash = 0.0f;
+
+// Pictures: drop 1.png ... 8.png (or .jpg) into posters/ and restart.
+#define MAX_POSTERS 8
+#define POSTER_RES 96
+static Color posterData[MAX_POSTERS][POSTER_RES][POSTER_RES];
+static bool posterLoaded[MAX_POSTERS];
+static signed char posterAt[MW][MH];
+static bool showMeteors = true;
+static bool quitRequested = false;
+static Font chatFont;
+static bool customChatFont = false;
+static void InitChatFont(void) {
+    const char *names[] = { "C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/tahoma.ttf" };
+    int cps[512],count=0;
+    for(int c=32;c<=126;++c) cps[count++]=c;
+    for(int c=0x0400;c<=0x052F;++c) cps[count++]=c;
+    for(int i=0;i<3;++i) if(FileExists(names[i])) {
+        chatFont=LoadFontEx(names[i],21,cps,count);
+        if(chatFont.texture.id>0) {customChatFont=true;SetTextureFilter(chatFont.texture,TEXTURE_FILTER_BILINEAR);break;}
+    }
+    if(!customChatFont) chatFont=GetFontDefault();
+}
+static void DrawChatText(const char *str, int x,int y,int fs,Color color) {
+    DrawTextEx(chatFont,str,(Vector2){(float)x,(float)y},(float)fs,1.0f,color);
+}
+
+
+static void AddChatLine(const char *msg) {
+    for (int i = MAX_CHAT_LINES - 1; i > 0; --i) {
+        memcpy(chatLines[i], chatLines[i-1], sizeof(chatLines[i]));
+        chatLineTimes[i] = chatLineTimes[i-1];
+    }
+    snprintf(chatLines[0], sizeof(chatLines[0]), "%s", msg);
+    chatLineTimes[0] = (float)GetTime();
+}
+static void AddKillLine(int killer, int victim) {
+    for (int i = MAX_KILL_LINES-1; i > 0; --i) {
+        memcpy(killLines[i], killLines[i-1], sizeof(killLines[i]));
+        killLineTimes[i] = killLineTimes[i-1];
+    }
+    snprintf(killLines[0], sizeof(killLines[0]), "Player %d killed Player %d", killer+1, victim+1);
+    killLineTimes[0] = (float)GetTime();
+}
+static void ClearPlayers(void) {
+    memset(netPlayers, 0, sizeof(netPlayers));
+    memset(netActive, 0, sizeof(netActive));
+    memset(clientAddrs, 0, sizeof(clientAddrs));
+    memset(lastHeard, 0, sizeof(lastHeard));
+    memset(deathAnimPending, 0, sizeof(deathAnimPending));
+    connectedClients = 0;
+}
+
 
 // 8 гарантированно свободных точек спавна в разных комнатах карты
 static const float spawnPoints[8][2] = {
@@ -251,6 +326,24 @@ static const float spawnPoints[8][2] = {
 	{145.5f, 160.5f}  // Юго-восточная комната (сдвинули с ящика 150,160)
 };
 
+static void OnMyDeath(void) {
+    if (myPlayerID < 0 || myPlayerID >= MAX_NET_PLAYERS) return;
+    if (netPlayers[myPlayerID].isDead) return;
+    netPlayers[myPlayerID].health = 0;
+    netPlayers[myPlayerID].isDead = true;
+    netPlayers[myPlayerID].deaths++;
+    deathAnimPending[myPlayerID] = true;
+    deathAnimStart[myPlayerID] = (float)GetTime();
+    deathFlash = 1.0f;
+    respawnTimer = 0.0f;
+    pistol.ammo = 0; // old ammunition is lost on death
+    pistol.isReloading = false;
+    pistol.reloadTimer = 0.0f;
+    pistol.animTimer = 0.0f;
+    if (sndDeath.frameCount > 0) PlaySound(sndDeath);
+    EnableCursor();
+}
+
 void RespawnMe(void) {
 	int idx = (myPlayerID >= 0 && myPlayerID < 8) ? myPlayerID : (rand() % 8);
 	player.x = spawnPoints[idx][0];
@@ -261,6 +354,13 @@ void RespawnMe(void) {
 	player.vz = 0.0f;
 	player.onGround = true;
 	player.stamina = player.maxStamina;
+    isFullyExhausted = false;
+    pistol.ammo = pistol.maxAmmo;
+    pistol.isReloading = false;
+    pistol.reloadTimer = 0.0f;
+    deathFlash = 0.0f;
+    deathAnimPending[myPlayerID >= 0 && myPlayerID < MAX_NET_PLAYERS ? myPlayerID : 0] = false;
+    if (!showTabMenu && !showChatInput) DisableCursor();
 	
 	if (myPlayerID >= 0 && myPlayerID < MAX_NET_PLAYERS) {
 		netPlayers[myPlayerID].x = player.x;
@@ -312,9 +412,11 @@ void StartServer(int serverNumber) {
 		printf("SERVER BIND ERROR: %d\n", WSAGetLastError());
 	}
 	
-	memset(netPlayers, 0, sizeof(netPlayers));
-	memset(clientAddrs, 0, sizeof(clientAddrs));
+	ClearPlayers();
 	netPlayers[0].id = 0;
+	netPlayers[0].faceID = rand() % 8;
+	netActive[0] = true;
+	lastHeard[0] = (float)GetTime();
 	connectedClients = 1;
 	RespawnMe();
 }
@@ -395,7 +497,7 @@ void ConnectToServer(const char* ip, int srvNum) {
 	myPlayerID = -1;
 	currentServerNumber = srvNum;
 	
-	memset(netPlayers, 0, sizeof(netPlayers));
+	ClearPlayers();
 	memset(&serverAddr, 0, sizeof(serverAddr));
 	serverAddr.sin_family = AF_INET;
 	serverAddr.sin_port = htons(SERVER_PORT);
@@ -448,6 +550,41 @@ void SendEvent(PacketType type, int targetID, int damage) {
 	}
 }
 
+static void SendChat(const char *msg) {
+    if (myPlayerID < 0 || udpSocket == INVALID_SOCKET || !msg || !msg[0]) return;
+    NetworkPacket pkt = {0};
+    pkt.type = PKT_CHAT;
+    pkt.senderID = myPlayerID;
+    snprintf(pkt.message, sizeof(pkt.message), "%s", msg);
+    if (isServer) {
+        for (int i=1; i<MAX_NET_PLAYERS; ++i)
+            if (netActive[i]) sendto(udpSocket, (const char*)&pkt, sizeof(pkt), 0,
+                                      (struct sockaddr*)&clientAddrs[i], sizeof(clientAddrs[i]));
+    } else if (isClient) {
+        sendto(udpSocket, (const char*)&pkt, sizeof(pkt), 0,
+               (struct sockaddr*)&serverAddr, sizeof(serverAddr));
+    }
+}
+
+static void LeaveServer(void) {
+    if (udpSocket != INVALID_SOCKET && myPlayerID >= 0) SendEvent(PKT_DISCONNECT, -1, 0);
+    if (udpSocket != INVALID_SOCKET) { closesocket(udpSocket); udpSocket = INVALID_SOCKET; }
+    WSACleanup();
+    isServer = false;
+    isClient = false;
+    myPlayerID = -1;
+    ClearPlayers();
+    showTabMenu = false;
+    showChatInput = false;
+    EnableCursor();
+}
+
+static void ReturnToMainMenu(void) {
+    LeaveServer();
+    currentState = STATE_MENU;
+    menuSelection = 0;
+}
+
 void UpdateNetwork(void) {
 	if (udpSocket == INVALID_SOCKET) return;
 	NetworkPacket pkt;
@@ -456,7 +593,9 @@ void UpdateNetwork(void) {
 	
 	while (true) {
 		int bytesReceived = recvfrom(udpSocket, (char*)&pkt, sizeof(pkt), 0, (struct sockaddr*)&fromAddr, &fromLen);
-		if (bytesReceived <= 0) break;
+        if (bytesReceived <= 0) break;
+        if (bytesReceived != sizeof(pkt)) continue;
+        fromLen=sizeof(fromAddr);
 		
 		if (pkt.type == PKT_DISCOVERY && isServer) {
 			NetworkPacket reply;
@@ -497,11 +636,17 @@ void UpdateNetwork(void) {
 						netPlayers[i].id = i;
 						netPlayers[i].health = 100;
 						netPlayers[i].isDead = false;
+                        netPlayers[i].faceID = rand() % 8;
+                        netActive[i] = true;
+                        lastHeard[i] = (float)GetTime();
+                        char joined[96]; snprintf(joined, sizeof(joined), "Player %d joined", i+1);
+                        AddChatLine(joined);
 						connectedClients++;
 						break;
 					}
 				}
 			}
+            if(assignedID != -1) lastHeard[assignedID]=(float)GetTime();
 			if (assignedID != -1) {
 				NetworkPacket ack;
 				memset(&ack, 0, sizeof(ack));
@@ -517,17 +662,17 @@ void UpdateNetwork(void) {
 				netPlayers[myPlayerID].id = myPlayerID;
 				netPlayers[myPlayerID].health = 100;
 				netPlayers[myPlayerID].faceID = rand() % 8;
-			}
+                netActive[myPlayerID] = true;
+                lastHeard[myPlayerID] = (float)GetTime();
+                RespawnMe(); // spawn point matches newly assigned player slot
+            }
 		}
 		else if (pkt.type == PKT_HIT) {
 			if (pkt.targetID == myPlayerID && myPlayerID >= 0 && !netPlayers[myPlayerID].isDead) {
 				netPlayers[myPlayerID].health -= pkt.damage;
 				if (netPlayers[myPlayerID].health <= 0) {
-					netPlayers[myPlayerID].health = 0;
-					netPlayers[myPlayerID].isDead = true;
-					respawnTimer = 2.0f;
-					if (sndDeath.frameCount > 0) PlaySound(sndDeath);
-				} else if (sndHit.frameCount > 0) {
+                    OnMyDeath();
+                } else if (sndHit.frameCount > 0) {
 					PlaySound(sndHit);
 				}
 			}
@@ -539,9 +684,69 @@ void UpdateNetwork(void) {
 				}
 			}
 		}
+        else if (pkt.type == PKT_KILL) {
+            if (pkt.senderID >= 0 && pkt.senderID < MAX_NET_PLAYERS &&
+                pkt.targetID >= 0 && pkt.targetID < MAX_NET_PLAYERS) {
+                AddKillLine(pkt.senderID, pkt.targetID);
+                if (isServer) {
+                    for (int i=1; i<MAX_NET_PLAYERS; ++i)
+                        if (netActive[i] && i != pkt.senderID)
+                            sendto(udpSocket, (const char*)&pkt, sizeof(pkt), 0,
+                                   (struct sockaddr*)&clientAddrs[i], sizeof(clientAddrs[i]));
+                }
+            }
+        }
+        else if (pkt.type == PKT_CHAT) {
+            pkt.message[sizeof(pkt.message)-1] = '\0';
+            if (pkt.senderID >= 0 && pkt.senderID < MAX_NET_PLAYERS && netActive[pkt.senderID]) {
+                char line[192];
+                snprintf(line, sizeof(line), "Player %d: %.128s", pkt.senderID+1, pkt.message);
+                AddChatLine(line);
+                if (isServer) {
+                    for (int i=1; i<MAX_NET_PLAYERS; ++i)
+                        if (netActive[i] && i != pkt.senderID)
+                            sendto(udpSocket, (const char*)&pkt, sizeof(pkt), 0,
+                                   (struct sockaddr*)&clientAddrs[i], sizeof(clientAddrs[i]));
+                }
+            }
+        }
+        else if (pkt.type == PKT_DISCONNECT) {
+            int id = pkt.senderID;
+            if (id < 0 || id >= MAX_NET_PLAYERS) continue;
+            if (isServer && id > 0) {
+                if (!netActive[id] || clientAddrs[id].sin_addr.s_addr!=fromAddr.sin_addr.s_addr ||
+                    clientAddrs[id].sin_port!=fromAddr.sin_port)continue;
+                memset(&clientAddrs[id], 0, sizeof(clientAddrs[id]));
+                if (connectedClients > 1) --connectedClients;
+                for (int i=1; i<MAX_NET_PLAYERS; ++i)
+                    if (netActive[i] && i != id)
+                        sendto(udpSocket, (const char*)&pkt, sizeof(pkt), 0,
+                               (struct sockaddr*)&clientAddrs[i], sizeof(clientAddrs[i]));
+            }
+            if(isServer && id==0)continue;
+            char line[96]; snprintf(line, sizeof(line), "Player %d left the server", id+1);
+            AddChatLine(line);
+            netActive[id] = false;
+            memset(&netPlayers[id], 0, sizeof(netPlayers[id]));
+            deathAnimPending[id] = false;
+            if (isClient && id == 0) { ReturnToMainMenu(); return; }
+        }
 		else if (pkt.type == PKT_STATE_UPDATE) {
 			if (pkt.senderID >= 0 && pkt.senderID < MAX_NET_PLAYERS && pkt.senderID != myPlayerID) {
-				netPlayers[pkt.senderID] = pkt.playerData;
+                int id = pkt.senderID;
+                if (isServer && (id == 0 || !netActive[id])) continue;
+                if (!netActive[id]) {
+                    char line[96]; snprintf(line, sizeof(line), "Player %d joined", id+1);
+                    AddChatLine(line);
+                }
+                if (!netPlayers[id].isDead && pkt.playerData.isDead) {
+                    deathAnimStart[id] = (float)GetTime();
+                    deathAnimPending[id] = true;
+                }
+                netPlayers[id] = pkt.playerData;
+                netPlayers[id].faceID = (unsigned int)netPlayers[id].faceID % 8;
+                netActive[id] = true;
+                lastHeard[id] = (float)GetTime();
 				if (isServer) {
 					for (int i = 1; i < MAX_NET_PLAYERS; i++) {
 						if (i != pkt.senderID && clientAddrs[i].sin_addr.s_addr != 0) {
@@ -550,8 +755,33 @@ void UpdateNetwork(void) {
 					}
 				}
 			}
-		}
-	}
+        }
+    }
+    // UDP has no reliable disconnect: drop stale clients after 8 seconds.
+    if(isClient && myPlayerID>=0) {
+        for(int i=0;i<MAX_NET_PLAYERS;++i) {
+            if(i==myPlayerID || !netActive[i] || (float)GetTime()-lastHeard[i]<=8.0f)continue;
+            char msg[96];snprintf(msg,sizeof(msg),"Player %d timed out",i+1);
+            AddChatLine(msg);
+            netActive[i]=false;
+            memset(&netPlayers[i],0,sizeof(netPlayers[i]));
+            deathAnimPending[i]=false;
+            if(i==0) {ReturnToMainMenu();return;}
+        }
+    }
+    if(isServer) for(int i=1;i<MAX_NET_PLAYERS;++i) {
+        if(netActive[i] && (float)GetTime()-lastHeard[i]>8.0f) {
+            NetworkPacket gone={0};gone.type=PKT_DISCONNECT;gone.senderID=i;
+            netActive[i]=false;
+            memset(&clientAddrs[i],0,sizeof(clientAddrs[i]));
+            memset(&netPlayers[i],0,sizeof(netPlayers[i]));
+            deathAnimPending[i]=false;
+            if(connectedClients>1)--connectedClients;
+            char msg[96];snprintf(msg,sizeof(msg),"Player %d timed out",i+1);AddChatLine(msg);
+            for(int j=1;j<MAX_NET_PLAYERS;++j) if(netActive[j])
+                sendto(udpSocket,(const char*)&gone,sizeof(gone),0,(struct sockaddr*)&clientAddrs[j],sizeof(clientAddrs[j]));
+        }
+    }
 }
 
 
@@ -574,6 +804,8 @@ __attribute__((aligned(64))) int   botZBuf[SW];
 __attribute__((aligned(64))) int   shadeFloorBuf[SH];
 
 float zbuf[SW];
+float moonLightBuf[SW];
+int wallMapXBuf[SW],wallMapYBuf[SW];
 
 int   drawEndBuf[SW];
 int   texIDBuf[SW];
@@ -654,33 +886,61 @@ static inline Color MixColor(Color a, Color b, float t) {
 #define TOFU_SIZE 64
 Color tofuData[8][TOFU_SIZE][TOFU_SIZE]; // Массив для пиксельного рендера
 
-void GenerateTofuTextures() {
-	for (int f = 0; f < 8; f++) {
-		for (int y = 0; y < TOFU_SIZE; y++) {
-			for (int x = 0; x < TOFU_SIZE; x++) {
-				unsigned char noise = (hash2(x, y) % 20);
-				Color c = (Color){240 - noise, 240 - noise, 230 - noise, 255};
-				
-				if (x < 4 || x > TOFU_SIZE - 4 || y < 4 || y > TOFU_SIZE - 4) c = (Color){200, 200, 200, 255};
-				
-				int cx = TOFU_SIZE / 2, cy = TOFU_SIZE / 2;
-				
-				// Глаза
-				if ((abs(x - (cx - 10)) < 3 && abs(y - (cy - 10)) < 3) || (abs(x - (cx + 10)) < 3 && abs(y - (cy - 10)) < 3)) c = BLACK;
-				
-				// Рот
-				if (f == 0 && x > cx - 10 && x < cx + 10 && y == cy + 10) c = BLACK;
-				if (f == 1 && x > cx - 10 && x < cx + 10 && abs(y - (cy + 10 + (x - cx)/2)) < 2) c = BLACK;
-				if (f == 2 && x > cx - 8 && x < cx + 8 && y > cy + 8 && y < cy + 14) c = BLACK;
-				if (f == 3 && y == cy + 10 && (x == cx - 10 || x == cx || x == cx + 10)) c = BLACK;
-				
-				// Повязка
-				if (f >= 4 && x > cx - 18 && x < cx - 2 && y > cy - 16 && y < cy - 4) c = RED;
-				
-				tofuData[f][y][x] = c;
-			}
-		}
-	}
+void GenerateTofuTextures(void) {
+    // Entire image is a face decal; no opaque square frame around it.
+    for (int f=0; f<8; ++f) for (int y=0; y<TOFU_SIZE; ++y) for (int x=0; x<TOFU_SIZE; ++x) {
+        float nx = (x-31.5f)/31.5f, ny = (y-31.5f)/31.5f;
+        unsigned char grain = (unsigned char)(hash2(x+f*17, y) % 12);
+        Color c = { (unsigned char)(224-grain), (unsigned char)(217-grain), (unsigned char)(199-grain), 255 };
+        // Black eyebrows, eyes and varied expressions.
+        bool leftEye = (abs(x-20)<4 && abs(y-25)<5);
+        bool rightEye = (abs(x-44)<4 && abs(y-25)<5);
+        if (leftEye || rightEye) c = (Color){16,17,19,255};
+        if (abs(y-17)<2 && ((x>=15 && x<=26) || (x>=39 && x<=50))) c = (Color){45,38,32,255};
+        float mouthY = 43.0f;
+        if (f%4 == 0) mouthY += fabsf(x-32)*0.28f;
+        if (f%4 == 1) mouthY -= fabsf(x-32)*0.25f;
+        if (f%4 == 2 && abs(x-32)<9 && y>40 && y<49) c = (Color){35,26,30,255};
+        if (f%4 != 2 && x>20 && x<44 && fabsf(y-mouthY)<2.1f) c = (Color){35,26,30,255};
+        if (f>=4 && x>=10 && x<=28 && y>=23 && y<=31) c = (Color){85,105,116,255};
+        if (nx*nx+ny*ny > 1.05f) c.a=0;
+        tofuData[f][y][x]=c;
+    }
+}
+
+static void LoadPosters(void) {
+    memset(posterLoaded, 0, sizeof(posterLoaded));
+    for (int i=0; i<MAX_POSTERS; ++i) {
+        char path[128];
+        snprintf(path,sizeof(path),"posters/%d.png",i+1);
+        if (!FileExists(path)) snprintf(path,sizeof(path),"posters/%d.jpg",i+1);
+        if (!FileExists(path)) snprintf(path,sizeof(path),"posters/%d.jpeg",i+1);
+        if (!FileExists(path)) continue;
+        Image im=LoadImage(path);
+        if (!im.data || im.width<=0 || im.height<=0) continue;
+        // Cropping to a square avoids stretching of photographs.
+        int side=im.width<im.height?im.width:im.height;
+        ImageCrop(&im,(Rectangle){(float)(im.width-side)/2,(float)(im.height-side)/2,(float)side,(float)side});
+        ImageResize(&im,POSTER_RES,POSTER_RES);
+        for (int y=0;y<POSTER_RES;++y)
+            for(int x=0;x<POSTER_RES;++x)
+                posterData[i][y][x]=GetImageColor(im,x,y);
+        posterLoaded[i]=true;
+        UnloadImage(im);
+    }
+}
+
+static void PlacePosters(void) {
+    memset(posterAt,-1,sizeof(posterAt));
+    int available[MAX_POSTERS],total=0;
+    for(int i=0;i<MAX_POSTERS;++i)if(posterLoaded[i])available[total++]=i;
+    if(total==0)return;
+    for(int x=1;x<MW-1;++x) for(int y=1;y<MH-1;++y) {
+        if(map[x][y].type!=CELL_WALL || (hash2(x,y)%31u)!=0u) continue;
+        bool visible=(map[x-1][y].type==CELL_EMPTY || map[x+1][y].type==CELL_EMPTY ||
+                      map[x][y-1].type==CELL_EMPTY || map[x][y+1].type==CELL_EMPTY);
+        if(visible) posterAt[x][y]=(signed char)available[hash2(x+37,y+11)%(unsigned int)total];
+    }
 }
 
 // ------------------------------------------------------------
@@ -1657,7 +1917,7 @@ void SpawnBulletHole(float startX, float startY, float startZ, float dirX, float
 
 		// ПРОВЕРКА ПОПАДАНИЯ В ИГРОКА
 		for (int i = 0; i < MAX_NET_PLAYERS; i++) {
-			if (i == myPlayerID || netPlayers[i].isDead) continue;
+			if (i == myPlayerID || !netActive[i] || netPlayers[i].isDead) continue;
 			
 			// Координаты игрока
 			float dxP = netPlayers[i].x - startX;
@@ -1672,18 +1932,21 @@ void SpawnBulletHole(float startX, float startY, float startZ, float dirX, float
 				float sideDistP = fabsf(dxP * (-dirY) + dyP * dirX);
 				
 				// Если луч прошел близко к центру (радиус Тофу ~0.4f)
-				if (sideDistP < 0.4f) {
-					netPlayers[i].health -= 25;
-					
-					if (netPlayers[i].health <= 0) {
-						netPlayers[i].isDead = true;
-						if (sndDeath.frameCount > 0) PlaySound(sndDeath);
-					} else {
-						if (sndHit.frameCount > 0) PlaySound(sndHit);
-					}
-					
-					SendEvent(PKT_HIT, i, 25);
-					return; // Пуля попала в игрока, дальше не летит
+				if (sideDistP < PLAYER_RADIUS &&
+                    startZ + dirZ*projDistP > netPlayers[i].z &&
+                    startZ + dirZ*projDistP < netPlayers[i].z + PLAYER_HEIGHT) {
+                    netPlayers[i].health -= 25;
+                    if (netPlayers[i].health <= 0) {
+                        netPlayers[i].health = 0;
+                        netPlayers[i].isDead = true;
+                        netPlayers[myPlayerID].kills++;
+                        deathAnimPending[i] = true;
+                        deathAnimStart[i] = (float)GetTime();
+                        AddKillLine(myPlayerID, i);
+                        SendEvent(PKT_KILL, i, 0);
+                    } else if (sndHit.frameCount > 0) PlaySound(sndHit);
+                    SendEvent(PKT_HIT, i, 25);
+                    return; // Пуля попала в игрока, дальше не летит
 				}
 			}
 		}
@@ -1720,6 +1983,21 @@ void SpawnBulletHole(float startX, float startY, float startZ, float dirX, float
 			}
 		}
 	}
+}
+
+static void SpawnDroppedMagazine(void) {
+    float rightX=-sinf(player.pa), rightY=cosf(player.pa);
+    for(int i=0;i<MAX_SHELLS;++i) if(!shells[i].active) {
+        Shell *a=&shells[i];
+        a->active=true; a->isMagazine=true;
+        a->x=player.x+cosf(player.pa)*0.28f+rightX*0.18f;
+        a->y=player.y+sinf(player.pa)*0.28f+rightY*0.18f;
+        a->z=player.z+EYE_HEIGHT-0.18f;
+        a->vx=cosf(player.pa)*0.45f+rightX*0.7f;
+        a->vy=sinf(player.pa)*0.45f+rightY*0.7f;
+        a->vz=0.7f; a->life=9.0f;
+        break;
+    }
 }
 
 void FireWeapon(void) {
@@ -1787,7 +2065,8 @@ void FireWeapon(void) {
 			shells[i].vx = cosf(player.pa) * 1.5f + rightX * 1.0f + (rand() % 100 - 50) * 0.02f;
 			shells[i].vy = sinf(player.pa) * 1.5f + rightY * 1.0f + (rand() % 100 - 50) * 0.02f;
 			shells[i].vz = 2.5f + (rand() % 100 - 50) * 0.02f;
-			shells[i].life = 5.0f;
+            shells[i].life = 5.0f;
+            shells[i].isMagazine = false;
 			break;
 		}
 	}
@@ -1797,7 +2076,8 @@ void FireWeapon(void) {
 	for (int i = 0; i < MAX_SHELLS; i++) {
 		if (!shells[i].active) continue;
 		
-		shells[i].life -= dt;
+        shells[i].life -= dt;
+        if (shells[i].life <= 0) { shells[i].active = false; continue; }
 		
 		float drag = expf(-1.5f * dt);
 		shells[i].vx *= drag;
@@ -1846,45 +2126,18 @@ void FireWeapon(void) {
 }
 
 	void UpdatePlayer(float dt) {
-		Vector2 md = GetMouseDelta();
-	
-	// --- 1. ДВИГАЕМ ПРИЦЕЛ ВНУТРИ ЭКРАНА ---
-	float aimSensitivity = 1.5f; 
-	player.crosshairX += md.x * aimSensitivity;
-	player.crosshairY += md.y * aimSensitivity;
-	
-	float limitX = 300.0f;
-	float limitY = 200.0f;
-	
-	// --- 2. ЕСЛИ ПРИЦЕЛ УПЕРСЯ В КРАЙ — КРУТИМ КАМЕРУ ---
-	if (player.crosshairX > limitX) {
-		player.pa += (player.crosshairX - limitX) * 0.001f;
-		player.crosshairX = limitX;
-	}
-	if (player.crosshairX < -limitX) {
-		player.pa += (player.crosshairX + limitX) * 0.001f;
-		player.crosshairX = -limitX;
-	}
-	
-	// Крутим камеру вверх/вниз (pitch теперь в радианах!)
-	float pitchSpeed = 0.002f; 
-	if (player.crosshairY > limitY) {
-		player.pitch -= (player.crosshairY - limitY) * pitchSpeed;
-		player.crosshairY = limitY;
-	}
-	if (player.crosshairY < -limitY) {
-		player.pitch -= (player.crosshairY + limitY) * pitchSpeed;
-		player.crosshairY = -limitY;
-	}
-	
-	// Ограничиваем наклон камеры (используем MAX_PITCH, который мы добавили в начале)
-	if (player.pitch > MAX_PITCH) player.pitch = MAX_PITCH;
-	if (player.pitch < -MAX_PITCH) player.pitch = -MAX_PITCH;
-	
-	// Защита от переполнения горизонтального угла
-	if (player.pa < 0.0f)      player.pa += 2.0f * PI;
-	if (player.pa > 2.0f * PI) player.pa -= 2.0f * PI;
-	
+	    // Fixed crosshair and direct mouse look (CS-style instead of floating crosshair).
+    Vector2 md=GetMouseDelta();
+    player.crosshairX=0.0f;
+    player.crosshairY=0.0f;
+    player.aimSpreadX=0.0f;
+    player.aimSpreadY=0.0f;
+    player.pa+=md.x*0.0025f;
+    player.pitch-=md.y*0.0025f;
+    player.pitch=fmaxf(-MAX_PITCH,fminf(MAX_PITCH,player.pitch));
+    if(player.pa<0.0f)player.pa+=2.0f*PI;
+    if(player.pa>=2.0f*PI)player.pa-=2.0f*PI;
+
 	float cosA = cosf(player.pa);
 	float sinA = sinf(player.pa);
 	float wx = 0.0f, wy = 0.0f;
@@ -1911,7 +2164,7 @@ void FireWeapon(void) {
 		} else if (wantsToSprint && isMoving && player.stamina > 0.0f) {
 			isSprinting = true;
 			maxSpeed *= 1.6f; 
-			player.stamina -= 25.0f * dt; 
+			player.stamina -= 10.0f * dt; 
 			if (player.stamina < 0.0f) player.stamina = 0.0f;
 		}
 		
@@ -2033,7 +2286,8 @@ void FireWeapon(void) {
 	// --- ПЕРЕЗАРЯДКА ---
 	if (IsKeyPressed(KEY_R) && !pistol.isReloading && pistol.ammo < pistol.maxAmmo) {
 		pistol.isReloading = true;
-		pistol.reloadTimer = pistol.reloadTime;
+        pistol.reloadTimer = pistol.reloadTime;
+        SpawnDroppedMagazine();
 		if (pistol.sndReloadStart.frameCount > 0) PlaySound(pistol.sndReloadStart);
 	}
 	
@@ -2136,13 +2390,20 @@ void RenderFrame(Color *pixels) {
 		
 		float perpDist = (side == 0) ? (mapX - camX + (1 - stepX)/2.0f) / rayDirX : (mapY - camY + (1 - stepY)/2.0f) / rayDirY;
 		if (perpDist < 0.1f) perpDist = 0.1f;
-		zbuf[x] = perpDist;
+        zbuf[x] = perpDist;
+        wallMapXBuf[x]=mapX;
+        wallMapYBuf[x]=mapY;
 		
 		float wallFloorZ = Z_FLOOR, wallCeilZ = Z_CEIL; int wallTexID = 0;
 		float lightMultiplier = 1.0f;
 		if (side == 0) lightMultiplier = (rayDirX > 0) ? 0.65f : 1.0f;
 		else           lightMultiplier = (rayDirY > 0) ? 0.65f : 1.0f;
-		lightBuf[x] = lightMultiplier;
+        lightBuf[x] = lightMultiplier;
+        // The lit side of a wall receives weak cool moonlight.
+        float normalX=(side==0)?-stepX:0.0f;
+        float normalY=(side==1)?-stepY:0.0f;
+        float moonDot=normalX*cosf(2.5f)+normalY*sinf(2.5f);
+        moonLightBuf[x] = fmaxf(0.0f, moonDot) * 0.16f;
 		
 		if (mapX >= 0 && mapX < MW && mapY >= 0 && mapY < MH) {
 			Cell *c = &map[mapX][mapY]; 
@@ -2237,10 +2498,32 @@ void RenderFrame(Color *pixels) {
 				Color c = wallTex[texIDBuf[x]][ty][txBuf[x]];
 				float shade = 1.0f - (perpBuf[x] / depth) * 0.85f;
 				if (shade < 0.2f) shade = 0.2f;
-				shade *= lightBuf[x];
-				if (sideBuf[x] == 1) shade *= 0.75f;
-				
-				row[x] = (Color){ (unsigned char)(c.r * shade), (unsigned char)(c.g * shade), (unsigned char)(c.b * shade), 255 };
+                shade *= lightBuf[x];
+                if (sideBuf[x] == 1) shade *= 0.75f;
+                // Poster is rendered as a decal on the real wall face, not a free-floating sprite.
+                int wcX=wallMapXBuf[x];
+                int wcY=wallMapYBuf[x];
+                if (wcX>=0 && wcX<MW && wcY>=0 && wcY<MH) {
+                    int pi=(int)posterAt[wcX][wcY];
+                    if(pi>=0 && pi<MAX_POSTERS && posterLoaded[pi]) {
+                        float u=txBuf[x]/(float)TS;
+                        float worldZ=camZ+(horizon-y)*perpBuf[x]/projPlane;
+                        float z0=map[wcX][wcY].floorZ+0.9f;
+                        if(u>=0.14f && u<0.86f && worldZ>=z0 && worldZ<z0+0.72f) {
+                            int pu=(int)((u-0.14f)/0.72f*POSTER_RES);
+                            int pv=(int)((z0+0.72f-worldZ)/0.72f*POSTER_RES);
+                            if(pu>=0 && pu<POSTER_RES && pv>=0 && pv<POSTER_RES) {
+                                c=posterData[pi][pv][pu];
+                                if(pu<2 || pv<2 || pu>=POSTER_RES-2 || pv>=POSTER_RES-2)
+                                    c=(Color){26,25,24,255};
+                            }
+                        }
+                    }
+                }
+                float moon=moonLightBuf[x];
+                row[x]=(Color){(unsigned char)fminf(255.0f,c.r*shade*(1.0f+moon*0.60f)),
+                                (unsigned char)fminf(255.0f,c.g*shade*(1.0f+moon*0.80f)),
+                                (unsigned char)fminf(255.0f,c.b*shade*(1.0f+moon*1.55f)),255};
 			} 
 			else if (hasFloor) {
 				// --- 3. ПОЛ (без деления внутри цикла по X) ---
@@ -2257,67 +2540,111 @@ void RenderFrame(Color *pixels) {
 				int ftx = (int)((floorX - (float)cellX) * (float)TS) & (TS - 1);
 				int fty = (int)((floorY - (float)cellY) * (float)TS) & (TS - 1);
 				
-				Color c = floorTex[ftex][fty][ftx];
-				row[x] = (Color){ (unsigned char)(c.r * fshade), (unsigned char)(c.g * fshade), (unsigned char)(c.b * fshade), 255 };
+                Color c=floorTex[ftex][fty][ftx];
+                // Disguise the harsh floor texture seam directly below walls/crates.
+                if(cellX>0 && cellY>0 && cellX<MW-1 && cellY<MH-1) {
+                    int tx=-1;
+                    float fu=floorX-cellX, fv=floorY-cellY;
+                    float nearest=1.0f;
+                    if(map[cellX-1][cellY].type==CELL_WALL && fu<nearest){nearest=fu;tx=map[cellX-1][cellY].wallTex;}
+                    if(map[cellX+1][cellY].type==CELL_WALL && 1.0f-fu<nearest){nearest=1.0f-fu;tx=map[cellX+1][cellY].wallTex;}
+                    if(map[cellX][cellY-1].type==CELL_WALL && fv<nearest){nearest=fv;tx=map[cellX][cellY-1].wallTex;}
+                    if(map[cellX][cellY+1].type==CELL_WALL && 1.0f-fv<nearest){nearest=1.0f-fv;tx=map[cellX][cellY+1].wallTex;}
+                    if(tx>=0 && tx<N_WALL_TEX && nearest<0.12f) {
+                        Color base=wallTex[tx][TS-12][(int)((fu+fv)*127.0f)&(TS-1)];
+                        c=MixColor(c,base,(0.12f-nearest)/0.12f*0.75f);
+                    }
+                }
+                row[x]=(Color){(unsigned char)fminf(255.0f,c.r*fshade*1.03f),
+                                (unsigned char)fminf(255.0f,c.g*fshade*1.04f),
+                                (unsigned char)fminf(255.0f,c.b*fshade*1.10f),255};
 			}
 		}
 	}
 	
 // ===== ПРОХОД 3: ПЛАВНОЕ ЗАТУХАНИЕ СПРАЙТОВ (НЕЛИНЕЙНЫЙ МАСШТАБ + ALPHA FADE) =====
 	
-// 3. ОТРИСОВКА ДРУГИХ ИГРОКОВ (ТОФУ)
-	for (int i = 0; i < MAX_NET_PLAYERS; i++) {
-		if (i == myPlayerID || netPlayers[i].isDead) continue; 
-		if (netPlayers[i].x == 0 && netPlayers[i].y == 0) continue; // Пустой слот
-		
-		float dx = netPlayers[i].x - camX;
-		float dy = netPlayers[i].y - camY;
-		float projDist = dx * dirX + dy * dirY;
-		
-		if (projDist < 0.2f || projDist > depth) continue; 
-		
-		float sideDist = dx * (-dirY) + dy * dirX;
-		float camXc = sideDist / (projDist * planeLen);
-		float screenX = (camXc + 1.0f) * ((float)SW * 0.5f) - (bobH * 0.5f);
-		int px = (int)screenX;
-		
-		if (px < 0 || px >= SW) continue;
-		if (projDist > zbuf[px] + 0.2f) continue;
-		
-		float spriteH = (1.7f / projDist) * projPlane;
-		float spriteW = (0.5f / projDist) * projPlane;
-		
-		int py = (int)((float)horizon - (netPlayers[i].z - camZ) / projDist * projPlane);
-		
-		int startX = px - (int)(spriteW / 2);
-		int endX = px + (int)(spriteW / 2);
-		int startY = py - (int)spriteH;
-		int endY = py;
-		
-		for (int sy = startY; sy < endY; sy++) {
-			if (sy < 0 || sy >= SH) continue;
-			for (int sx = startX; sx < endX; sx++) {
-				if (sx < 0 || sx >= SW) continue;
-				if (projDist > zbuf[sx]) continue; 
-				
-				int texX = (int)((float)(sx - startX) / spriteW * TOFU_SIZE);
-				int texY = (int)((float)(sy - startY) / spriteH * TOFU_SIZE);
-				if (texX < 0) { texX = 0; }
-				if (texX >= TOFU_SIZE) { texX = TOFU_SIZE - 1; }
-				if (texY < 0) { texY = 0; }
-				if (texY >= TOFU_SIZE) { texY = TOFU_SIZE - 1; }
-				
-				
-				Color c = tofuData[netPlayers[i].faceID][texY][texX];
-				if (c.a == 0) continue;
-				
-				float shade = 1.0f - (projDist / depth) * 0.85f;
-				if (shade < 0.2f) shade = 0.2f;
-				pixels[sy * SW + sx] = (Color){ c.r * shade, c.g * shade, c.b * shade, 255 };
-			}
-		}
-	}
-	
+// 3. Other players are depth-tested cylinders with an expression on the facing side.
+    for(int i=0;i<MAX_NET_PLAYERS;++i) {
+        if(i==myPlayerID || !netActive[i]) continue;
+        NetworkPlayer *np=&netPlayers[i];
+        float sink=0.0f;
+        if(np->isDead) {
+            if(!deathAnimPending[i]) continue;
+            float elapsed=(float)GetTime()-deathAnimStart[i];
+            if(elapsed>1.2f) {deathAnimPending[i]=false;continue;}
+            sink=fminf(1.0f,elapsed/1.2f)*PLAYER_HEIGHT*1.2f;
+        }
+        float dx=np->x-camX,dy=np->y-camY;
+        float forward=dx*dirX+dy*dirY;
+        float side=dx*(-dirY)+dy*dirX;
+        if(forward<=0.15f || forward>depth+1.0f)continue;
+        float cx=(side/(forward*planeLen)+1.0f)*SW*0.5f;
+        float width=(PLAYER_RADIUS/forward)*projPlane*2.4f;
+        int xl=(int)floorf(cx-width),xr=(int)ceilf(cx+width);
+        if(xl<0)xl=0; if(xr>=SW)xr=SW-1;
+        for(int sx=xl;sx<=xr;++sx) {
+            float cameraColumn=2.0f*sx/(float)SW-1.0f;
+            float rx=dirX+planeX*cameraColumn, ry=dirY+planeY*cameraColumn;
+            float ox=camX-np->x,oy=camY-np->y;
+            float a=rx*rx+ry*ry,b=2.0f*(ox*rx+oy*ry);
+            float d=b*b-4.0f*a*(ox*ox+oy*oy-PLAYER_RADIUS*PLAYER_RADIUS);
+            if(d<0.0f) continue;
+            float hit=(-b-sqrtf(d))/(2.0f*a);
+            if(hit<0.08f || hit>depth || hit>=zbuf[sx]-0.02f)continue;
+            float hitx=camX+rx*hit-np->x,hity=camY+ry*hit-np->y;
+            float normalX=hitx/PLAYER_RADIUS,normalY=hity/PLAYER_RADIUS;
+            int top=(int)(horizon-((np->z+PLAYER_HEIGHT-sink)-camZ)/hit*projPlane);
+            int bottom=(int)(horizon-((np->z-sink)-camZ)/hit*projPlane);
+            if(top>=SH || bottom<0 || top>=bottom)continue;
+            if(top<0)top=0;if(bottom>=SH)bottom=SH-1;
+            float faceForward=cosf(np->pa)*normalX+sinf(np->pa)*normalY;
+            float faceSide=-sinf(np->pa)*normalX+cosf(np->pa)*normalY;
+            float shade=fmaxf(0.22f,1.0f-hit/depth*0.80f);
+            shade*=0.72f+0.28f*fmaxf(0.0f,normalX*cosf(2.5f)+normalY*sinf(2.5f));
+            for(int sy=top;sy<=bottom;++sy) {
+                float worldZ=camZ+(horizon-sy)*hit/projPlane;
+                float v=(np->z+PLAYER_HEIGHT-sink-worldZ)/PLAYER_HEIGHT;
+                Color c={183,180,163,255};
+                // The face decal only appears in the direction the player looks.
+                if(faceForward>0.70f && fabsf(faceSide)<0.68f && v>0.16f && v<0.82f) {
+                    float u=0.5f+faceSide/1.36f;
+                    float fv=(v-0.16f)/0.66f;
+                    int tx=(int)(u*TOFU_SIZE),ty=(int)(fv*TOFU_SIZE);
+                    if(tx>=0&&tx<TOFU_SIZE&&ty>=0&&ty<TOFU_SIZE) {
+                        Color decal=tofuData[((unsigned int)np->faceID)%8][ty][tx];
+                        if(decal.a) c=decal;
+                    }
+                }
+                pixels[sy*SW+sx]=(Color){(unsigned char)(c.r*shade),
+                                            (unsigned char)(c.g*shade),
+                                            (unsigned char)(c.b*shade),255};
+            }
+        }
+    }
+
+    // Occasional falling stars, drawn only in uncovered sky pixels.
+    if(showMeteors) {
+        float tm=(float)GetTime();
+        for(int m=0;m<3;++m){
+            float phase=fmodf(tm+m*3.79f,11.0f);
+            if(phase>0.9f)continue;
+            float baseAngle=0.55f+m*1.93f;
+            float angle=baseAngle-player.pa;
+            while(angle>PI)angle-=2*PI;
+            while(angle< -PI)angle+=2*PI;
+            if(fabsf(angle)>fov*0.58f)continue;
+            int mx=(int)(SW*0.5f+tanf(angle)*(SW*0.5f)/tanf(fov*0.5f)+phase*120.0f);
+            int my=(int)(horizon-200.0f+phase*165.0f);
+            for(int q=0;q<25;++q){
+                int xx=mx-q, yy=my-q/3;
+                if(xx<0||xx>=SW||yy<0||yy>=SH||yy>=drawStartBuf[xx])continue;
+                float alpha=(25-q)/25.0f;
+                pixels[yy*SW+xx]=MixColor(pixels[yy*SW+xx],(Color){190,215,255,255},alpha);
+            }
+        }
+    }
+
 	// 1. ОТРЕСОВКА ДЫРОК ОТ ПУЛЬ
 	for (int i = 0; i < MAX_BULLETS; i++) {
 		if (!bulletHoles[i].active) continue;
@@ -2415,12 +2742,12 @@ void RenderFrame(Color *pixels) {
 		float sizeScale = (1.0f - t) * (1.0f - t);
 		
 		// Минимум 1x1 пиксель до самых 100 метров, чтобы растворялась без скачка
-		int w = (int)roundf(7.0f * sizeScale);
-		int h = (int)roundf(3.0f * sizeScale);
+        int w = (int)roundf((shells[i].isMagazine ? 17.0f : 7.0f) * sizeScale);
+        int h = (int)roundf((shells[i].isMagazine ? 29.0f : 3.0f) * sizeScale);
 		if (w < 1) w = 1;
-		if (w > 7) w = 7;
-		if (h < 1) h = 1;
-		if (h > 3) h = 3;
+        if (w > (shells[i].isMagazine?17:7)) w = shells[i].isMagazine?17:7;
+        if (h < 1) h = 1;
+        if (h > (shells[i].isMagazine?29:3)) h = shells[i].isMagazine?29:3;
 		
 		// Плавный Fade Out от 75 до 100 метров + затухание в конце жизни гильзы (последняя 1.0 секунда)
 		float alpha = 1.0f;
@@ -2443,7 +2770,13 @@ void RenderFrame(Color *pixels) {
 		Color col_rim   = { (unsigned char)(130 * distShade), (unsigned char)(90 * distShade),  (unsigned char)(40 * distShade),  255 };
 		Color col_body  = { (unsigned char)(190 * distShade), (unsigned char)(150 * distShade), (unsigned char)(60 * distShade),  255 };
 		Color col_shine = { (unsigned char)(255 * distShade), (unsigned char)(230 * distShade), (unsigned char)(150 * distShade), 255 };
-		Color col_shade = { (unsigned char)(110 * distShade), (unsigned char)(80 * distShade),  (unsigned char)(30 * distShade),  255 };
+        Color col_shade = { (unsigned char)(110 * distShade), (unsigned char)(80 * distShade),  (unsigned char)(30 * distShade),  255 };
+        if (shells[i].isMagazine) {
+            col_rim=(Color){(unsigned char)(65*distShade),(unsigned char)(69*distShade),(unsigned char)(78*distShade),255};
+            col_body=(Color){(unsigned char)(135*distShade),(unsigned char)(143*distShade),(unsigned char)(154*distShade),255};
+            col_shine=(Color){(unsigned char)(180*distShade),(unsigned char)(185*distShade),(unsigned char)(194*distShade),255};
+            col_shade=(Color){(unsigned char)(94*distShade),(unsigned char)(100*distShade),(unsigned char)(113*distShade),255};
+        }
 		
 		int py = (int)((float)horizon - (shells[i].z - camZ) / projDist * projPlane);
 		
@@ -2452,7 +2785,7 @@ void RenderFrame(Color *pixels) {
 			if (projDist > zbuf[sx_loop] + 0.1f) continue;
 			
 			int current_h = h;
-			if (sx_loop > px + w / 4) current_h = h - 1;
+            if (!shells[i].isMagazine && sx_loop > px + w / 4) current_h = h - 1;
 			if (current_h < 1) current_h = 1;
 			
 			for (int sy = py - current_h / 2; sy <= py + current_h / 2; sy++) {
@@ -2660,6 +2993,120 @@ void DrawMiniMap(RenderTexture2D minimapRT) {
 //  GLSL ШЕЙДЕР
 // ------------------------------------------------------------
 
+// Screen-space HUD helpers: raycaster world stays separate from game UI.
+static bool DrawMenuButton(Rectangle rect, const char *caption, Color hoverColor) {
+    bool hover=CheckCollisionPointRec(GetMousePosition(),rect);
+    DrawRectangleRec(rect,hover?hoverColor:(Color){34,44,57,245});
+    DrawRectangleLinesEx(rect,2,(Color){118,144,169,255});
+    int fs=18;
+    DrawText(caption,(int)(rect.x+(rect.width-MeasureText(caption,fs))*0.5f),
+             (int)(rect.y+(rect.height-fs)*0.5f),fs,RAYWHITE);
+    return hover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+}
+
+static void DrawPlayerHealth(int curW,int curH) {
+    if(myPlayerID<0 || myPlayerID>=MAX_NET_PLAYERS) return;
+    int health=netPlayers[myPlayerID].health;
+    if(health<0) health=0; if(health>100) health=100;
+    int w=235,h=17,x=24,y=curH-62;
+    DrawRectangle(x-4,y-4,w+8,h+8,(Color){9,16,24,213});
+    DrawRectangle(x,y,w,h,(Color){44,48,56,240});
+    Color fill=(health>60)?(Color){61,206,139,255}:(health>25)?(Color){240,183,71,255}:(Color){226,70,71,255};
+    DrawRectangle(x+2,y+2,(int)((w-4)*health/100.0f),h-4,fill);
+    DrawRectangleLines(x-4,y-4,w+8,h+8,(Color){137,161,181,245});
+    DrawText(TextFormat("HP  %d / 100",health),x,y-23,18,RAYWHITE);
+}
+
+static void DrawGameChat(int curH) {
+    float now=(float)GetTime();
+    int lines=0;
+    // Oldest first, so messages grow down toward the text field.
+    for(int i=MAX_CHAT_LINES-1;i>=0;--i)
+        if(chatLines[i][0] && (showChatInput || now-chatLineTimes[i]<10.0f)) lines++;
+    int baseY=curH-125-lines*23;
+    if(lines>0 || showChatInput) {
+        int h=(lines+1)*23+(showChatInput?38:5);
+        DrawRectangle(14,baseY-9,480,h,Fade((Color){8,16,23,255},0.70f));
+    }
+    int y=baseY;
+    for(int i=MAX_CHAT_LINES-1;i>=0;--i) {
+        if(!chatLines[i][0] || (!showChatInput&&now-chatLineTimes[i]>=10.0f)) continue;
+        DrawChatText(chatLines[i],22,y,18,(Color){220,230,236,255});
+        y+=23;
+    }
+    if(showChatInput) {
+        DrawRectangle(18,y+3,472,32,(Color){27,46,60,246});
+        DrawChatText(TextFormat("[T] %s_",chatInput),25,y+8,19,RAYWHITE);
+    }
+}
+
+static void DrawKillsFeed(int curW) {
+    float now=(float)GetTime();
+    int row=0;
+    for(int i=0;i<MAX_KILL_LINES;++i) {
+        if(!killLines[i][0] || now-killLineTimes[i]>6.5f) continue;
+        int x=curW-402, y=20+row*30;
+        DrawRectangle(x-7,y-5,385,29,Fade((Color){8,16,23,255},0.75f));
+        DrawText(killLines[i],x,y,18,(Color){255,214,154,255});
+        row++;
+    }
+}
+
+static void DrawKeyHints(void) {
+    if(!showKeyHints)return;
+    int x=18,y=18;
+    const char *lines[]={"W A S D   MOVE","SHIFT     SPRINT","SPACE     JUMP","R         RELOAD","TAB       PLAYERS","T         CHAT","5         HIDE HINTS","M         MAP"};
+    DrawRectangle(x-8,y-9,225,246,Fade((Color){12,19,27,255},0.77f));
+    DrawRectangleLines(x-8,y-9,225,246,(Color){100,131,148,225});
+    DrawText("CONTROLS",x+3,y,18,(Color){155,215,248,255});
+    for(int i=0;i<8;++i) DrawText(lines[i],x+3,y+31+i*24,17,RAYWHITE);
+}
+
+static void DrawScoreboard(int curW,int curH) {
+    const int w=580,h=498;
+    int x=curW/2-w/2,y=curH/2-h/2;
+    DrawRectangle(0,0,curW,curH,Fade(BLACK,0.38f));
+    DrawRectangle(x,y,w,h,(Color){12,23,34,248});
+    DrawRectangleLinesEx((Rectangle){(float)x,(float)y,(float)w,(float)h},2,(Color){100,171,194,255});
+    int count=0;for(int i=0;i<MAX_NET_PLAYERS;++i)if(netActive[i])count++;
+    DrawText(TextFormat("SERVER #%d",currentServerNumber),x+24,y+22,28,(Color){163,218,249,255});
+    DrawText(TextFormat("PLAYERS  %d / 8",count),x+w-195,y+28,19,RAYWHITE);
+    if(isServer)DrawText(TextFormat("HOST: %s",myLocalIP),x+24,y+60,16,(Color){171,187,204,255});
+    DrawRectangle(x+18,y+92,w-36,32,(Color){36,61,77,255});
+    DrawText("PLAYER",x+32,y+100,17,RAYWHITE);
+    DrawText("K",x+307,y+100,17,RAYWHITE);
+    DrawText("D",x+379,y+100,17,RAYWHITE);
+    DrawText("KD%",x+448,y+100,17,RAYWHITE);
+    for(int i=0;i<MAX_NET_PLAYERS;++i) {
+        int yy=y+132+i*30;
+        if(i%2==0) DrawRectangle(x+18,yy-3,w-36,29,(Color){23,40,53,255});
+        Color co=netActive[i]?(i==myPlayerID?(Color){143,238,186,255}:RAYWHITE):(Color){102,118,132,255};
+        DrawText(TextFormat("Player %d%s",i+1,i==myPlayerID?"  (YOU)":""),x+32,yy+2,18,co);
+        if(netActive[i]) {
+            int k=netPlayers[i].kills,d=netPlayers[i].deaths;
+            int kd=(k+d>0)?(int)(100.0f*k/(k+d)+0.5f):0;
+            DrawText(TextFormat("%d",k),x+303,yy+2,18,co);
+            DrawText(TextFormat("%d",d),x+376,yy+2,18,co);
+            DrawText(TextFormat("%d%%",kd),x+443,yy+2,18,co);
+        } else DrawText("--          --         --",x+303,yy+2,17,co);
+    }
+    Rectangle menuBtn={(float)(x+25),(float)(y+h-72),245,48};
+    Rectangle exitBtn={(float)(x+310),(float)(y+h-72),245,48};
+    bool goMenu=DrawMenuButton(menuBtn,"MAIN MENU",(Color){36,99,111,255});
+    bool exitGame=DrawMenuButton(exitBtn,"EXIT GAME",(Color){145,49,48,255});
+    if(goMenu)ReturnToMainMenu();
+    if(exitGame) {LeaveServer();quitRequested=true;}
+}
+
+static void DrawDeathScreen(int curW,int curH) {
+    DrawRectangle(0,0,curW,curH,Fade(WHITE,0.95f));
+    DrawText("YOU DIED",curW/2-MeasureText("YOU DIED",52)/2,curH/2-105,52,(Color){43,55,67,255});
+    DrawText("Your next life starts with a fresh magazine",curW/2-MeasureText("Your next life starts with a fresh magazine",18)/2,
+             curH/2-34,18,(Color){84,91,97,255});
+    Rectangle b={(float)(curW/2-148),(float)(curH/2+30),296,62};
+    if(DrawMenuButton(b,"RESPAWN",(Color){49,132,100,255})) RespawnMe();
+}
+
 static const char *ps2FragmentShader =
 "#version 330\n"
 "in vec2 fragTexCoord;\n"
@@ -2747,10 +3194,13 @@ static const char *ps2FragmentShader =
 	
 	InitWindow(SW, SH, "Battle simulation in hard times");
 	SetExitKey(KEY_NULL);
-	InitAudioDevice();
+    InitAudioDevice();
+    InitChatFont();
 	GenerateAllTextures();
 	GenerateTofuTextures();
 	GenMap();
+    LoadPosters();
+    PlacePosters();
 		
 	
 	// --- ЗАГРУЗКА СПРАЙТОВ ГЛОКА ---
@@ -2826,7 +3276,8 @@ static const char *ps2FragmentShader =
 	
 	while (!WindowShouldClose()) {
 		float dt = GetFrameTime();
-		if (dt > 0.05f) dt = 0.05f;
+	    if(dt>0.05f)dt=0.05f;
+    if(dt<0.00001f)dt=0.00001f;
 		
 		if (hasMusic) UpdateMusicStream(music);
 		
@@ -2914,7 +3365,8 @@ static const char *ps2FragmentShader =
 						}
 						
 						if (IsKeyPressed(KEY_R)) DiscoverServers();
-						if (IsKeyPressed(KEY_BACKSPACE)) {
+	                    if (IsKeyPressed(KEY_BACKSPACE)) {
+                            LeaveServer();
 							menuSelection = 0;
 							currentState = STATE_LOBBY;
 						}
@@ -2951,10 +3403,11 @@ static const char *ps2FragmentShader =
 				}
 			}
 		}
-		else if (currentState == STATE_PLAYING) {
-			UpdateNetwork();
-			
-			// Если клиент еще не получил ID от сервера — повторяем запрос входа раз в 0.5 сек
+        else if (currentState == STATE_PLAYING) {
+            UpdateNetwork();
+            if (currentState != STATE_PLAYING) continue; // Host may have disconnected.
+
+            // Если клиент еще не получил ID от сервера — повторяем запрос входа раз в 0.5 сек
 			if (isClient && myPlayerID < 0) {
 				static float joinRetryTimer = 0.0f;
 				joinRetryTimer += dt;
@@ -2967,29 +3420,57 @@ static const char *ps2FragmentShader =
 				}
 			}
 			
-			if (IsKeyPressed(KEY_TAB)) {
-				showTabMenu = !showTabMenu;
-				if (showTabMenu) EnableCursor();
-				else DisableCursor();
-			}
-			
-			if (myPlayerID >= 0 && myPlayerID < MAX_NET_PLAYERS) {
-				if (netPlayers[myPlayerID].isDead) {
-					respawnTimer -= dt;
-					if (respawnTimer <= 0.0f) RespawnMe();
-				} else if (!showTabMenu) {
-					UpdatePlayer(dt);
-				}
-				
-				netPlayers[myPlayerID].x = player.x;
-				netPlayers[myPlayerID].y = player.y;
-				netPlayers[myPlayerID].z = player.z;
-				netPlayers[myPlayerID].pa = player.pa;
-				SendMyState(netPlayers[myPlayerID]);
-			} else if (!showTabMenu) {
-				UpdatePlayer(dt);
-			}
-			
+            if(IsKeyPressed(KEY_FIVE)) showKeyHints=!showKeyHints;
+            if(IsKeyPressed(KEY_TAB) && !showChatInput) {
+                showTabMenu=!showTabMenu;
+                if(showTabMenu || (myPlayerID>=0 && netPlayers[myPlayerID].isDead)) EnableCursor();
+                else DisableCursor();
+            }
+            if(IsKeyPressed(KEY_T) && !showChatInput && !showTabMenu && myPlayerID>=0 && !netPlayers[myPlayerID].isDead) {
+                showChatInput=true;
+                chatInput[0]='\0';
+                // Drain the T character that opened the chat.
+                while(GetCharPressed()>0){}
+            } else if(showChatInput) {
+                int cp=GetCharPressed();
+                while(cp>0) {
+                    if(cp>=32 && cp<0x10000) {
+                        int length=0;
+                        const char *utf8=CodepointToUTF8(cp,&length);
+                        size_t old=strlen(chatInput);
+                        if(length>0 && old+(size_t)length<sizeof(chatInput)-1) {
+                            memcpy(chatInput+old,utf8,(size_t)length);
+                            chatInput[old+length]='\0';
+                        }
+                    }
+                    cp=GetCharPressed();
+                }
+                if(IsKeyPressed(KEY_BACKSPACE)) {
+                    size_t n=strlen(chatInput);
+                    if(n) {--n;while(n>0&&((unsigned char)chatInput[n]&0xC0)==0x80)--n;chatInput[n]='\0';}
+                }
+                if(IsKeyPressed(KEY_ESCAPE)) {showChatInput=false;chatInput[0]='\0';}
+                if(IsKeyPressed(KEY_ENTER)) {
+                    if(chatInput[0]) {
+                        char line[192];snprintf(line,sizeof(line),"Player %d: %.128s",myPlayerID+1,chatInput);
+                        AddChatLine(line);
+                        SendChat(chatInput);
+                    }
+                    showChatInput=false;chatInput[0]='\0';
+                }
+            }
+            if(myPlayerID>=0 && myPlayerID<MAX_NET_PLAYERS) {
+                if(!netPlayers[myPlayerID].isDead && !showTabMenu && !showChatInput) {
+                    UpdatePlayer(dt);
+                }
+                netPlayers[myPlayerID].x=player.x;
+                netPlayers[myPlayerID].y=player.y;
+                netPlayers[myPlayerID].z=player.z;
+                netPlayers[myPlayerID].pa=player.pa;
+                SendMyState(netPlayers[myPlayerID]);
+            }
+            deathFlash=fmaxf(0.0f,deathFlash-dt*0.9f);
+
 			if (volume_ui_timer > 0.0f) volume_ui_timer -= dt;
 			if (stamina_ui_timer > 0.0f) stamina_ui_timer -= dt;
 			if (IsKeyDown(KEY_LEFT_BRACKET)) { music_volume -= 0.5f * dt; if (music_volume < 0.0f) music_volume = 0.0f; volume_ui_timer = 2.0f; }
@@ -3021,7 +3502,7 @@ static const char *ps2FragmentShader =
 			else if (pistol.currentFrame == 2) currentTex = pistol.texFire2;
 			else if (pistol.currentFrame == 3) currentTex = pistol.texFire3;
 			
-			if (currentTex.id > 0) {
+            if (currentTex.id > 0 && (myPlayerID < 0 || !netPlayers[myPlayerID].isDead)) {
 				float scale = 0.4f;
 				int offsetX = 50;
 				int offsetY = 0;
@@ -3210,7 +3691,7 @@ static const char *ps2FragmentShader =
 				}
 				
 				if (numberAlpha > 0.01f) {
-					int ammoToShow = pistol.isReloading ? pistol.maxAmmo : pistol.ammo;
+					int ammoToShow = pistol.isReloading ? (magIsFull ? pistol.maxAmmo : pistol.ammo) : pistol.ammo;
 					unsigned char a1 = (unsigned char)(255 * numberAlpha);
 					unsigned char a2 = (unsigned char)(220 * numberAlpha);
 					DrawText(TextFormat("%d", ammoToShow), magX - 95, magBottomY - 70, 64, (Color){250, 230, 170, a1});
@@ -3233,7 +3714,7 @@ static const char *ps2FragmentShader =
 				}
 				
 				// --- ПРИЦЕЛ ---
-				if (!showTabMenu) {
+				if (!showTabMenu && (myPlayerID<0 || !netPlayers[myPlayerID].isDead)) {
 					float scaleX = (float)curW / (float)SW;
 					float scaleY = (float)curH / (float)SH;
 					int cx = curW / 2 + (int)(player.crosshairX * scaleX);
@@ -3248,33 +3729,20 @@ static const char *ps2FragmentShader =
 					DrawLine(cx + gapX, cy - gapY, cx + gapX + len, cy - gapY, chColor);
 				}
 				
-				// --- ОВЕРЛЕЙ НА TAB (НОМЕР СЕРВЕРА И КНОПКА ВЫХОДА) ---
-				if (showTabMenu) {
-					int boxW = 360, boxH = 220;
-					int bx = curW / 2 - boxW / 2;
-					int by = curH / 2 - boxH / 2;
-					
-					DrawRectangle(bx, by, boxW, boxH, Fade(BLACK, 0.85f));
-					DrawRectangleLines(bx, by, boxW, boxH, (Color){150, 130, 90, 255});
-					
-					const char* srvTitle = TextFormat("SERVER #%d", currentServerNumber);
-					DrawText(srvTitle, curW / 2 - MeasureText(srvTitle, 32) / 2, by + 25, 32, (Color){255, 230, 150, 255});
-					
-					if (isServer) {
-						const char* ipTitle = TextFormat("HOST IP: %s", myLocalIP);
-						DrawText(ipTitle, curW / 2 - MeasureText(ipTitle, 20) / 2, by + 68, 20, LIGHTGRAY);
-					}
-					
-					Rectangle btnExit = { (float)(curW / 2 - 110), (float)(by + 120), 220, 50 };
-					bool hover = CheckCollisionPointRec(GetMousePosition(), btnExit);
-					DrawRectangleRec(btnExit, hover ? (Color){140, 45, 35, 255} : (Color){60, 25, 20, 255});
-					DrawRectangleLinesEx(btnExit, 2, (Color){200, 170, 120, 255});
-					DrawText("EXIT GAME", (int)btnExit.x + 48, (int)btnExit.y + 15, 20, RAYWHITE);
-					
-					if ((hover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) || IsKeyPressed(KEY_ENTER)) {
-						break;
-					}
-				}
+                DrawPlayerHealth(curW,curH);
+                DrawKillsFeed(curW);
+                if(!showTabMenu) {
+                    DrawKeyHints();
+                    if(showMap) {
+                        DrawTexturePro(minimapRT.texture,
+                            (Rectangle){0,0,200,-200},(Rectangle){16,showKeyHints?270:26,180,180},
+                            (Vector2){0,0},0.0f,WHITE);
+                    }
+                    DrawGameChat(curH);
+                }
+                if(showTabMenu) DrawScoreboard(curW,curH);
+                if(myPlayerID>=0 && netPlayers[myPlayerID].isDead) DrawDeathScreen(curW,curH);
+
 			}
 			
 			// БЕЛАЯ ВСПЫШКА
@@ -3283,9 +3751,13 @@ static const char *ps2FragmentShader =
 			}
 		}
 		
-		EndDrawing();
-	}
-	
+        EndDrawing();
+        if(quitRequested)break;
+    }
+
+    // Notify others even when the window was closed with the system X button.
+    if(udpSocket!=INVALID_SOCKET && myPlayerID>=0) SendEvent(PKT_DISCONNECT,-1,0);
+
 	// --- ВЫГРУЗКА ПАМЯТИ ---
 	if (pistol.texIdle.id > 0)   UnloadTexture(pistol.texIdle);
 	if (pistol.texFire1.id > 0)  UnloadTexture(pistol.texFire1);
@@ -3301,7 +3773,12 @@ static const char *ps2FragmentShader =
 	if (sndStaminaOut.frameCount > 0) UnloadSound(sndStaminaOut);
 	if (sndStaminaBack.frameCount > 0) UnloadSound(sndStaminaBack);
 	if (sndHit.frameCount > 0) UnloadSound(sndHit);
-	if (sndDeath.frameCount > 0) UnloadSound(sndHit);
+    if (sndDeath.frameCount > 0) UnloadSound(sndDeath);
+    if (pistol.sndShot.frameCount > 0) UnloadSound(pistol.sndShot);
+    if (pistol.sndReloadStart.frameCount > 0) UnloadSound(pistol.sndReloadStart);
+    if (pistol.sndReloadEnd.frameCount > 0) UnloadSound(pistol.sndReloadEnd);
+    if (pistol.sndEmpty.frameCount > 0) UnloadSound(pistol.sndEmpty);
+    if (customChatFont) UnloadFont(chatFont);
 	if (udpSocket != INVALID_SOCKET) closesocket(udpSocket);
 	WSACleanup();
 	
