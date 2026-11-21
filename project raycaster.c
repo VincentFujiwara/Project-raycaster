@@ -1,14 +1,28 @@
 #include "raylib.h"
-#define MMNOSOUND
-#define PlaySoundA PlaySoundAWin32
-#define PlaySoundW PlaySoundWWin32
-#include <math.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdint.h>
-#include <omp.h> // Для многопоточности
+#include "raymath.h"
 
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+#define WIN32_LEAN_AND_MEAN
+#define NOGDI
+#define NOUSER
+#define MMNOSOUND
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+typedef struct tagMSG MSG, *LPMSG;
+#include <iphlpapi.h>
+
+#undef near
+#undef far
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <math.h>
+#include <stdbool.h>
+#include <string.h>
+#include <time.h>
+	
 int cpu_threads = 4;
 
 // ------------------------------------------------------------
@@ -20,7 +34,7 @@ int cpu_threads = 4;
 #define SH 720
 #define MW 192
 #define MH 192
-#define TS 32
+#define TS 256
 #define SKY_W 10000
 #define SKY_H 5000
 
@@ -124,6 +138,8 @@ Weapon pistol;
 // ------------------------------------------------------------
 typedef enum {
 	STATE_MENU,
+	STATE_LOBBY,       // Экран выбора: Host или Join
+	STATE_SERVER_LIST, // Список найденных серверов
 	STATE_TRANSITION,
 	STATE_PLAYING,
 } GameState;
@@ -142,6 +158,8 @@ bool fadeToWhite = true;
 	Sound sndFootstep;
 	Sound sndStaminaOut;
 	Sound sndStaminaBack;
+	Sound sndHit;
+	Sound sndDeath;
 
 	float footstepTimer = 0.15f;
 	float shellSndCd = 0.0f;
@@ -168,11 +186,380 @@ typedef struct {
 Cell map[MW][MH];
 Player player;
 
-float fov       = 60.0f * (PI / 180.0f);
-float depth     = 64.0f;
-bool showMap = true;
+// ------------------------------------------------------------
+//  СЕТЕВОЙ КОД
+// ------------------------------------------------------------
+#define MAX_NET_PLAYERS 8
+#define SERVER_PORT 27015
+
+#pragma pack(push, 1)
+typedef struct {
+	int id;
+	float x, y, z;
+	float pa;
+	int health;
+	int faceID;
+	bool isDead;
+} NetworkPlayer;
+
+typedef enum {
+	PKT_DISCOVERY = 0,
+	PKT_SERVER_INFO,
+	PKT_JOIN,
+	PKT_STATE_UPDATE,
+	PKT_SHOOT,
+	PKT_HIT,
+	PKT_DISCONNECT
+} PacketType;
+
+typedef struct {
+	int type; // Используем int вместо enum, чтобы размер всегда был ровно 4 байта
+	int senderID;
+	NetworkPlayer playerData;
+	int targetID;
+	int damage;
+} NetworkPacket;
+#pragma pack(pop)
+
+NetworkPlayer netPlayers[MAX_NET_PLAYERS];
+int myPlayerID = -1;
+SOCKET udpSocket = INVALID_SOCKET;
+struct sockaddr_in serverAddr;
+struct sockaddr_in clientAddrs[MAX_NET_PLAYERS];
+bool isServer = false;
+bool isClient = false;
+int connectedClients = 0;
+int currentServerNumber = 1;
+int discoveredServersCount = 0;
+char myLocalIP[32] = "127.0.0.1";
+char manualIP[32] = "";
+bool typingIP = false;
+char discoveredServersIPs[10][32];
+int discoveredServerNums[10];
+bool showTabMenu = false;
+float respawnTimer = 0.0f;
+
+// 8 гарантированно свободных точек спавна в разных комнатах карты
+static const float spawnPoints[8][2] = {
+	{100.5f, 110.5f}, // Центральный зал (юг)
+	{90.5f,  90.5f},  // Центральный зал (север)
+	{45.5f,  100.5f}, // Левая комната
+	{155.5f, 100.5f}, // Правая комната (сдвинули с ящика 150,100)
+	{100.5f, 35.5f},  // Верхняя комната
+	{100.5f, 140.5f}, // Нижняя комната (туннели)
+	{45.5f,  40.5f},  // Северо-западная комната (сдвинули с ящика 50,40)
+	{145.5f, 160.5f}  // Юго-восточная комната (сдвинули с ящика 150,160)
+};
+
+void RespawnMe(void) {
+	int idx = (myPlayerID >= 0 && myPlayerID < 8) ? myPlayerID : (rand() % 8);
+	player.x = spawnPoints[idx][0];
+	player.y = spawnPoints[idx][1];
+	player.z = Z_FLOOR;
+	player.vx = 0.0f;
+	player.vy = 0.0f;
+	player.vz = 0.0f;
+	player.onGround = true;
+	player.stamina = player.maxStamina;
+	
+	if (myPlayerID >= 0 && myPlayerID < MAX_NET_PLAYERS) {
+		netPlayers[myPlayerID].x = player.x;
+		netPlayers[myPlayerID].y = player.y;
+		netPlayers[myPlayerID].z = player.z;
+		netPlayers[myPlayerID].health = 100;
+		netPlayers[myPlayerID].isDead = false;
+	}
+}
+
+bool InitNetwork(void) {
+	WSADATA wsaData;
+	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return false;
+	if (udpSocket != INVALID_SOCKET) closesocket(udpSocket);
+	udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (udpSocket == INVALID_SOCKET) return false;
+	
+	int broadcast = 1;
+	setsockopt(udpSocket, SOL_SOCKET, SO_BROADCAST, (char*)&broadcast, sizeof(broadcast));
+	
+	int reuse = 1;
+	setsockopt(udpSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&reuse, sizeof(reuse));
+	
+	u_long mode = 1;
+	ioctlsocket(udpSocket, FIONBIO, &mode);
+	
+	memset(&serverAddr, 0, sizeof(serverAddr));
+	serverAddr.sin_family = AF_INET;
+	serverAddr.sin_port = htons(SERVER_PORT);
+	return true;
+}
+
+void UpdateMyLocalIP(void);
+
+void StartServer(int serverNumber) {
+	isServer = true;
+	isClient = false;
+	myPlayerID = 0;
+	currentServerNumber = serverNumber;
+	UpdateMyLocalIP();
+	
+	struct sockaddr_in bindAddr;
+	memset(&bindAddr, 0, sizeof(bindAddr));
+	bindAddr.sin_family = AF_INET;
+	bindAddr.sin_port = htons(SERVER_PORT);
+	bindAddr.sin_addr.s_addr = INADDR_ANY;
+	
+	if (bind(udpSocket, (struct sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
+		printf("SERVER BIND ERROR: %d\n", WSAGetLastError());
+	}
+	
+	memset(netPlayers, 0, sizeof(netPlayers));
+	memset(clientAddrs, 0, sizeof(clientAddrs));
+	netPlayers[0].id = 0;
+	connectedClients = 1;
+	RespawnMe();
+}
+
+void UpdateMyLocalIP(void) {
+	ULONG outBufLen = 15000;
+	PIP_ADAPTER_ADDRESSES pAddresses = (IP_ADAPTER_ADDRESSES*)malloc(outBufLen);
+	if (GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, NULL, pAddresses, &outBufLen) == NO_ERROR) {
+		for (PIP_ADAPTER_ADDRESSES pCurr = pAddresses; pCurr != NULL; pCurr = pCurr->Next) {
+			if (pCurr->OperStatus != IfOperStatusUp) continue;
+			if (pCurr->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+			
+			for (PIP_ADAPTER_UNICAST_ADDRESS pUnicast = pCurr->FirstUnicastAddress; pUnicast != NULL; pUnicast = pUnicast->Next) {
+				struct sockaddr_in* sa = (struct sockaddr_in*)pUnicast->Address.lpSockaddr;
+				char ipStr[32];
+				inet_ntop(AF_INET, &(sa->sin_addr), ipStr, sizeof(ipStr));
+				// Приоритет отдаем Wi-Fi интерфейсу (IF_TYPE_IEEE80211)
+				if (pCurr->IfType == IF_TYPE_IEEE80211 || strcmp(myLocalIP, "127.0.0.1") == 0) {
+					strcpy(myLocalIP, ipStr);
+				}
+			}
+		}
+	}
+	if (pAddresses) free(pAddresses);
+}
+
+void SendDiscoveryBroadcast(void) {
+	if (udpSocket == INVALID_SOCKET) return;
+	
+	NetworkPacket pkt;
+	memset(&pkt, 0, sizeof(pkt));
+	pkt.type = PKT_DISCOVERY;
+	
+	struct sockaddr_in bcastAddr;
+	memset(&bcastAddr, 0, sizeof(bcastAddr));
+	bcastAddr.sin_family = AF_INET;
+	bcastAddr.sin_port = htons(SERVER_PORT);
+	
+	// 1. Общий broadcast и localhost
+	bcastAddr.sin_addr.s_addr = INADDR_BROADCAST;
+	sendto(udpSocket, (const char*)&pkt, sizeof(pkt), 0, (struct sockaddr*)&bcastAddr, sizeof(bcastAddr));
+	
+	bcastAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+	sendto(udpSocket, (const char*)&pkt, sizeof(pkt), 0, (struct sockaddr*)&bcastAddr, sizeof(bcastAddr));
+	
+	// 2. Перебор ВСЕХ активных адаптеров (включая Wi-Fi и точку доступа с телефона)
+	ULONG outBufLen = 15000;
+	PIP_ADAPTER_ADDRESSES pAddresses = (IP_ADAPTER_ADDRESSES*)malloc(outBufLen);
+	if (GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, NULL, pAddresses, &outBufLen) == NO_ERROR) {
+		for (PIP_ADAPTER_ADDRESSES pCurr = pAddresses; pCurr != NULL; pCurr = pCurr->Next) {
+			if (pCurr->OperStatus != IfOperStatusUp) continue;
+			if (pCurr->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+			
+			for (PIP_ADAPTER_UNICAST_ADDRESS pUnicast = pCurr->FirstUnicastAddress; pUnicast != NULL; pUnicast = pUnicast->Next) {
+				struct sockaddr_in* sa = (struct sockaddr_in*)pUnicast->Address.lpSockaddr;
+				ULONG mask = 0;
+				ConvertLengthToIpv4Mask(pUnicast->OnLinkPrefixLength, &mask);
+				
+				// Вычисляем точный широковещательный адрес подсети: IP | (~Mask)
+				bcastAddr.sin_addr.s_addr = (sa->sin_addr.s_addr & mask) | (~mask);
+				sendto(udpSocket, (const char*)&pkt, sizeof(pkt), 0, (struct sockaddr*)&bcastAddr, sizeof(bcastAddr));
+			}
+		}
+	}
+	if (pAddresses) free(pAddresses);
+}
+
+void DiscoverServers(void) {
+	isClient = true;
+	isServer = false;
+	discoveredServersCount = 0;
+	SendDiscoveryBroadcast();
+}
+
+void ConnectToServer(const char* ip, int srvNum) {
+	isClient = true;
+	isServer = false;
+	myPlayerID = -1;
+	currentServerNumber = srvNum;
+	
+	memset(netPlayers, 0, sizeof(netPlayers));
+	memset(&serverAddr, 0, sizeof(serverAddr));
+	serverAddr.sin_family = AF_INET;
+	serverAddr.sin_port = htons(SERVER_PORT);
+	serverAddr.sin_addr.s_addr = inet_addr(ip);
+	
+	NetworkPacket pkt;
+	memset(&pkt, 0, sizeof(pkt));
+	pkt.type = PKT_JOIN;
+	sendto(udpSocket, (const char*)&pkt, sizeof(pkt), 0, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
+	RespawnMe();
+}
+
+
+void SendMyState(NetworkPlayer myState) {
+	if (udpSocket == INVALID_SOCKET || myPlayerID < 0) return;
+	NetworkPacket pkt;
+	memset(&pkt, 0, sizeof(pkt));
+	pkt.type = PKT_STATE_UPDATE;
+	pkt.senderID = myPlayerID;
+	pkt.playerData = myState;
+	
+	if (isServer) {
+		for (int i = 1; i < MAX_NET_PLAYERS; i++) {
+			if (clientAddrs[i].sin_addr.s_addr != 0) {
+				sendto(udpSocket, (const char*)&pkt, sizeof(pkt), 0, (struct sockaddr*)&clientAddrs[i], sizeof(clientAddrs[i]));
+			}
+		}
+	} else if (isClient) {
+		sendto(udpSocket, (const char*)&pkt, sizeof(pkt), 0, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
+	}
+}
+
+void SendEvent(PacketType type, int targetID, int damage) {
+	if (udpSocket == INVALID_SOCKET || myPlayerID < 0) return;
+	NetworkPacket pkt;
+	memset(&pkt, 0, sizeof(pkt));
+	pkt.type = type;
+	pkt.senderID = myPlayerID;
+	pkt.targetID = targetID;
+	pkt.damage = damage;
+	
+	if (isServer) {
+		for (int i = 1; i < MAX_NET_PLAYERS; i++) {
+			if (clientAddrs[i].sin_addr.s_addr != 0) {
+				sendto(udpSocket, (const char*)&pkt, sizeof(pkt), 0, (struct sockaddr*)&clientAddrs[i], sizeof(clientAddrs[i]));
+			}
+		}
+	} else if (isClient) {
+		sendto(udpSocket, (const char*)&pkt, sizeof(pkt), 0, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
+	}
+}
+
+void UpdateNetwork(void) {
+	if (udpSocket == INVALID_SOCKET) return;
+	NetworkPacket pkt;
+	struct sockaddr_in fromAddr;
+	int fromLen = sizeof(fromAddr);
+	
+	while (true) {
+		int bytesReceived = recvfrom(udpSocket, (char*)&pkt, sizeof(pkt), 0, (struct sockaddr*)&fromAddr, &fromLen);
+		if (bytesReceived <= 0) break;
+		
+		if (pkt.type == PKT_DISCOVERY && isServer) {
+			NetworkPacket reply;
+			memset(&reply, 0, sizeof(reply));
+			reply.type = PKT_SERVER_INFO;
+			reply.senderID = currentServerNumber;
+			sendto(udpSocket, (const char*)&reply, sizeof(reply), 0, (struct sockaddr*)&fromAddr, fromLen);
+		}
+		else if (pkt.type == PKT_SERVER_INFO && isClient) {
+			char ipStr[32];
+			inet_ntop(AF_INET, &(fromAddr.sin_addr), ipStr, 32);
+			bool exists = false;
+			for (int i = 0; i < discoveredServersCount; i++) {
+				if (strcmp(discoveredServersIPs[i], ipStr) == 0) { exists = true; break; }
+			}
+			if (!exists && discoveredServersCount < 10) {
+				strcpy(discoveredServersIPs[discoveredServersCount], ipStr);
+				discoveredServerNums[discoveredServersCount] = pkt.senderID;
+				discoveredServersCount++;
+			}
+		}
+		else if (pkt.type == PKT_JOIN && isServer) {
+			int assignedID = -1;
+			// Проверяем, не подключен ли уже этот клиент (повторный пакет)
+			for (int i = 1; i < MAX_NET_PLAYERS; i++) {
+				if (clientAddrs[i].sin_addr.s_addr == fromAddr.sin_addr.s_addr &&
+					clientAddrs[i].sin_port == fromAddr.sin_port) {
+					assignedID = i;
+					break;
+				}
+			}
+			// Если новый — ищем свободный слот
+			if (assignedID == -1) {
+				for (int i = 1; i < MAX_NET_PLAYERS; i++) {
+					if (clientAddrs[i].sin_addr.s_addr == 0) {
+						assignedID = i;
+						clientAddrs[i] = fromAddr;
+						netPlayers[i].id = i;
+						netPlayers[i].health = 100;
+						netPlayers[i].isDead = false;
+						connectedClients++;
+						break;
+					}
+				}
+			}
+			if (assignedID != -1) {
+				NetworkPacket ack;
+				memset(&ack, 0, sizeof(ack));
+				ack.type = PKT_JOIN;
+				ack.senderID = assignedID;
+				sendto(udpSocket, (const char*)&ack, sizeof(ack), 0, (struct sockaddr*)&fromAddr, fromLen);
+			}
+		}
+		
+		else if (pkt.type == PKT_JOIN && isClient) {
+			myPlayerID = pkt.senderID;
+			if (myPlayerID >= 0 && myPlayerID < MAX_NET_PLAYERS) {
+				netPlayers[myPlayerID].id = myPlayerID;
+				netPlayers[myPlayerID].health = 100;
+				netPlayers[myPlayerID].faceID = rand() % 8;
+			}
+		}
+		else if (pkt.type == PKT_HIT) {
+			if (pkt.targetID == myPlayerID && myPlayerID >= 0 && !netPlayers[myPlayerID].isDead) {
+				netPlayers[myPlayerID].health -= pkt.damage;
+				if (netPlayers[myPlayerID].health <= 0) {
+					netPlayers[myPlayerID].health = 0;
+					netPlayers[myPlayerID].isDead = true;
+					respawnTimer = 2.0f;
+					if (sndDeath.frameCount > 0) PlaySound(sndDeath);
+				} else if (sndHit.frameCount > 0) {
+					PlaySound(sndHit);
+				}
+			}
+			if (isServer) {
+				for (int i = 1; i < MAX_NET_PLAYERS; i++) {
+					if (i != pkt.senderID && clientAddrs[i].sin_addr.s_addr != 0) {
+						sendto(udpSocket, (const char*)&pkt, sizeof(pkt), 0, (struct sockaddr*)&clientAddrs[i], sizeof(clientAddrs[i]));
+					}
+				}
+			}
+		}
+		else if (pkt.type == PKT_STATE_UPDATE) {
+			if (pkt.senderID >= 0 && pkt.senderID < MAX_NET_PLAYERS && pkt.senderID != myPlayerID) {
+				netPlayers[pkt.senderID] = pkt.playerData;
+				if (isServer) {
+					for (int i = 1; i < MAX_NET_PLAYERS; i++) {
+						if (i != pkt.senderID && clientAddrs[i].sin_addr.s_addr != 0) {
+							sendto(udpSocket, (const char*)&pkt, sizeof(pkt), 0, (struct sockaddr*)&clientAddrs[i], sizeof(clientAddrs[i]));
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
 
 // Буферы для двухпроходного рендера (ВЫРАВНЕНЫ ПО 64 БАЙТАМ ДЛЯ OPENMP)
+float fov     = 60.0f * (PI / 180.0f);
+float depth   = 64.0f;
+bool showMap  = true;
+
 __attribute__((aligned(64))) int rawStartBuf[SW], rawEndBuf[SW];
 __attribute__((aligned(64))) int   drawStartBuf[SW];
 __attribute__((aligned(64))) int   drawEndBuf[SW];
@@ -261,16 +648,52 @@ static inline Color MixColor(Color a, Color b, float t) {
 }
 
 // ------------------------------------------------------------
-//  СЕКТОР 3: ТЕКСТУРЫ СТЕН
+//  Спрайт игрока
 // ------------------------------------------------------------
 
-// Текстура 0: Песочный кирпич
+#define TOFU_SIZE 64
+Color tofuData[8][TOFU_SIZE][TOFU_SIZE]; // Массив для пиксельного рендера
+
+void GenerateTofuTextures() {
+	for (int f = 0; f < 8; f++) {
+		for (int y = 0; y < TOFU_SIZE; y++) {
+			for (int x = 0; x < TOFU_SIZE; x++) {
+				unsigned char noise = (hash2(x, y) % 20);
+				Color c = (Color){240 - noise, 240 - noise, 230 - noise, 255};
+				
+				if (x < 4 || x > TOFU_SIZE - 4 || y < 4 || y > TOFU_SIZE - 4) c = (Color){200, 200, 200, 255};
+				
+				int cx = TOFU_SIZE / 2, cy = TOFU_SIZE / 2;
+				
+				// Глаза
+				if ((abs(x - (cx - 10)) < 3 && abs(y - (cy - 10)) < 3) || (abs(x - (cx + 10)) < 3 && abs(y - (cy - 10)) < 3)) c = BLACK;
+				
+				// Рот
+				if (f == 0 && x > cx - 10 && x < cx + 10 && y == cy + 10) c = BLACK;
+				if (f == 1 && x > cx - 10 && x < cx + 10 && abs(y - (cy + 10 + (x - cx)/2)) < 2) c = BLACK;
+				if (f == 2 && x > cx - 8 && x < cx + 8 && y > cy + 8 && y < cy + 14) c = BLACK;
+				if (f == 3 && y == cy + 10 && (x == cx - 10 || x == cx || x == cx + 10)) c = BLACK;
+				
+				// Повязка
+				if (f >= 4 && x > cx - 18 && x < cx - 2 && y > cy - 16 && y < cy - 4) c = RED;
+				
+				tofuData[f][y][x] = c;
+			}
+		}
+	}
+}
+
+// ------------------------------------------------------------
+//  ОБНОВЛЕННЫЕ ТЕКСТУРЫ СТЕН (256x256)
+// ------------------------------------------------------------
+
+// Текстура 0: Песочный кирпич (Крупный)
 static void GenerateWall_SandBrick(Color tex[TS][TS]) {
 	Color brickA   = (Color){205, 175, 130, 255};
 	Color brickB   = (Color){190, 158, 112, 255};
 	
-	int brickH = 8;
-	int brickW = 16;
+	int brickH = 64;  // Размер кирпича по высоте
+	int brickW = 128; // Размер кирпича по ширине
 	
 	for (int y = 0; y < TS; y++) {
 		for (int x = 0; x < TS; x++) {
@@ -279,20 +702,20 @@ static void GenerateWall_SandBrick(Color tex[TS][TS]) {
 			int bx = (x + offset) % brickW;
 			int by = y % brickH;
 			
-			bool isMortar = (bx == 0 || by == 0);
+			bool isMortar = (bx < 8 || by < 8); // Толстый шов
 			
 			if (isMortar) {
-				float n = fbm(x * 0.3f, y * 0.3f, 2);
+				float n = fbm(x * 0.1f, y * 0.1f, 2);
 				unsigned char v = (unsigned char)(150 + n * 30);
 				tex[y][x] = (Color){v, (unsigned char)(v * 0.82f), (unsigned char)(v * 0.58f), 255};
 			} else {
 				int variant = ((bx * 7 + by * 13 + row * 17) % 5);
 				Color base = (variant < 3) ? brickA : brickB;
-				float n = fbm(x * 0.4f + row * 5.0f, y * 0.4f, 2);
+				float n = fbm(x * 0.15f + row * 5.0f, y * 0.15f, 2);
 				float shade = 0.85f + n * 0.3f;
 				
-				if (by == 1) shade *= 0.92f;
-				if (bx == 1) shade *= 0.95f;
+				if (by == 8) shade *= 0.92f;
+				if (bx == 8) shade *= 0.95f;
 				if (by == brickH - 1) shade *= 1.05f;
 				
 				tex[y][x] = (Color){
@@ -313,8 +736,8 @@ static void GenerateWall_Stucco(Color tex[TS][TS]) {
 	
 	for (int y = 0; y < TS; y++) {
 		for (int x = 0; x < TS; x++) {
-			float n = fbm(x * 0.25f, y * 0.25f, 3);
-			float cracks = fbm(x * 0.8f, y * 0.8f, 2);
+			float n = fbm(x * 0.05f, y * 0.05f, 3); // Уменьшили частоту шума для 256
+			float cracks = fbm(x * 0.1f, y * 0.1f, 2);
 			
 			Color c = MixColor(dark, base, n);
 			
@@ -332,7 +755,7 @@ static void GenerateWall_Stucco(Color tex[TS][TS]) {
 	}
 }
 
-// Текстура 2: Каменная кладка (туннели)
+// Текстура 2: Каменная кладка (Крупные камни)
 static void GenerateWall_Stone(Color tex[TS][TS]) {
 	Color mortar = (Color){88, 78, 62, 255};
 	Color stoneA = (Color){130, 118, 96, 255};
@@ -340,19 +763,19 @@ static void GenerateWall_Stone(Color tex[TS][TS]) {
 	
 	for (int y = 0; y < TS; y++) {
 		for (int x = 0; x < TS; x++) {
-			int row = y / 8;
-			int offset = (row % 2) * 8;
-			int bx = (x + offset) % 16;
-			int by = y % 8;
+			int row = y / 64; 
+			int offset = (row % 2) * 64;
+			int bx = (x + offset) % 128;
+			int by = y % 64;
 			
-			bool isMortar = (bx < 1 || by < 1);
+			bool isMortar = (bx < 8 || by < 8);
 			
 			if (isMortar) {
 				tex[y][x] = mortar;
 			} else {
 				int variant = (hash2(x, y + row * 17) & 3);
 				Color base = (variant < 2) ? stoneA : stoneB;
-				float n = fbm(x * 0.5f + row * 3.0f, y * 0.5f, 2);
+				float n = fbm(x * 0.1f + row * 3.0f, y * 0.1f, 2);
 				float shade = 0.85f + n * 0.3f;
 				
 				tex[y][x] = (Color){
@@ -366,10 +789,6 @@ static void GenerateWall_Stone(Color tex[TS][TS]) {
 	}
 }
 
-// ------------------------------------------------------------
-//  СЕКТОР 4: ТЕКСТУРЫ СТЕН
-// ------------------------------------------------------------
-
 // Текстура 3: Деревянный ящик
 static void GenerateWall_WoodCrate(Color tex[TS][TS]) {
 	Color plankLight = (Color){168, 122, 72, 255};
@@ -378,29 +797,30 @@ static void GenerateWall_WoodCrate(Color tex[TS][TS]) {
 	
 	for (int y = 0; y < TS; y++) {
 		for (int x = 0; x < TS; x++) {
-			bool isEdge = (x < 2 || x >= TS - 2 || y < 2 || y >= TS - 2);
-			bool isBrace = (abs((x - TS / 2) - (y - TS / 2)) < 2) ||
-			(abs((x - TS / 2) + (y - TS / 2) - TS / 2) < 2);
+			bool isEdge = (x < 16 || x >= TS - 16 || y < 16 || y >= TS - 16);
+			bool isBrace = (abs((x - TS / 2) - (y - TS / 2)) < 16) ||
+			(abs((x - TS / 2) + (y - TS / 2) - TS / 2) < 16);
 			
 			if (isEdge) {
 				tex[y][x] = edgeDark;
 			} else if (isBrace) {
-				float n = fbm(x * 0.4f, y * 0.4f, 2);
+				float n = fbm(x * 0.1f, y * 0.1f, 2);
 				Color c = MixColor(plankDark, edgeDark, 0.4f);
 				c.r = (unsigned char)(c.r * (0.85f + n * 0.3f));
 				c.g = (unsigned char)(c.g * (0.85f + n * 0.3f));
 				c.b = (unsigned char)(c.b * (0.85f + n * 0.3f));
 				tex[y][x] = c;
 			} else {
-				int plank = y / 8;
+				int plank = y / 64; 
 				Color base = (plank % 2 == 0) ? plankLight : plankDark;
-				float grain = sinf((float)x * 0.6f + fbm(x * 0.3f, y * 0.5f, 2) * 6.0f) * 0.5f + 0.5f;
+				float grain = sinf((float)x * 0.1f + fbm(x * 0.05f, y * 0.1f, 2) * 6.0f) * 0.5f + 0.5f;
 				float shade = 0.8f + grain * 0.4f;
 				
-				if (x >= 4 && x <= 6 && y >= 4 && y <= 6) shade *= 0.5f;
-				if (x >= TS-7 && x <= TS-5 && y >= 4 && y <= 6) shade *= 0.5f;
-				if (x >= 4 && x <= 6 && y >= TS-7 && y <= TS-5) shade *= 0.5f;
-				if (x >= TS-7 && x <= TS-5 && y >= TS-7 && y <= TS-5) shade *= 0.5f;
+				// Заклепки (гвозди) в углах
+				if (x >= 32 && x <= 48 && y >= 32 && y <= 48) shade *= 0.5f;
+				if (x >= TS-49 && x <= TS-33 && y >= 32 && y <= 48) shade *= 0.5f;
+				if (x >= 32 && x <= 48 && y >= TS-49 && y <= TS-33) shade *= 0.5f;
+				if (x >= TS-49 && x <= TS-33 && y >= TS-49 && y <= TS-33) shade *= 0.5f;
 				
 				tex[y][x] = (Color){
 					(unsigned char)(base.r * shade),
@@ -421,22 +841,23 @@ static void GenerateWall_MetalDoor(Color tex[TS][TS]) {
 	
 	for (int y = 0; y < TS; y++) {
 		for (int x = 0; x < TS; x++) {
-			bool isFrame = (x < 2 || x >= TS - 2 || y < 2 || y >= TS - 2);
+			bool isFrame = (x < 16 || x >= TS - 16 || y < 16 || y >= TS - 16);
 			
 			if (isFrame) {
 				tex[y][x] = metalDark;
 			} else {
-				float band = ((x / 4) % 2 == 0) ? 1.05f : 0.9f;
-				float n = fbm(x * 0.6f, y * 0.6f, 2);
+				float band = ((x / 32) % 2 == 0) ? 1.05f : 0.9f; 
+				float n = fbm(x * 0.1f, y * 0.1f, 2);
 				float shade = band * (0.8f + n * 0.3f);
 				Color c = MixColor(metalDark, metalLight, n);
 				
-				float rustNoise = fbm(x * 0.2f + 10.0f, y * 0.2f + 10.0f, 3);
+				float rustNoise = fbm(x * 0.05f + 10.0f, y * 0.05f + 10.0f, 3);
 				if (rustNoise > 0.65f) {
 					c = MixColor(c, rust, (rustNoise - 0.65f) * 1.8f);
 				}
 				
-				if (x >= TS/2 - 3 && x <= TS/2 + 3 && y >= TS/2 - 2 && y <= TS/2 + 2) {
+				// Замочная скважина
+				if (x >= TS/2 - 24 && x <= TS/2 + 24 && y >= TS/2 - 16 && y <= TS/2 + 16) {
 					c = (Color){50, 50, 55, 255};
 				}
 				
@@ -465,11 +886,12 @@ static void GenerateWall_Barrel(Color tex[TS][TS]) {
 			
 			Color c = MixColor(base, highlight, dv * 0.7f);
 			
-			if (y % 8 == 0 || y % 8 == 1) {
+			// Обручи бочки
+			if (y % 64 == 0 || y % 64 == 4) { 
 				c = MixColor(c, (Color){40, 40, 45, 255}, 0.7f);
 			}
 			
-			float n = fbm(x * 0.35f + 20.0f, y * 0.35f + 20.0f, 3);
+			float n = fbm(x * 0.05f + 20.0f, y * 0.05f + 20.0f, 3);
 			if (n > 0.6f) {
 				c = MixColor(c, rust, (n - 0.6f) * 1.5f);
 			}
@@ -491,10 +913,10 @@ static void GenerateWall_DarkStucco(Color tex[TS][TS]) {
 	
 	for (int y = 0; y < TS; y++) {
 		for (int x = 0; x < TS; x++) {
-			float n = fbm(x * 0.3f + 5.0f, y * 0.3f + 5.0f, 3);
+			float n = fbm(x * 0.05f + 5.0f, y * 0.05f + 5.0f, 3);
 			Color c = MixColor(dark, base, n);
 			
-			float dirt = fbm(x * 0.15f, y * 0.15f, 2);
+			float dirt = fbm(x * 0.02f, y * 0.02f, 2);
 			if (dirt > 0.7f) {
 				c = MixColor(c, (Color){50, 40, 28, 255}, (dirt - 0.7f) * 2.0f);
 			}
@@ -508,9 +930,9 @@ static void GenerateWall_DarkStucco(Color tex[TS][TS]) {
 static void GenerateWall_BrickMarked(Color tex[TS][TS]) {
 	GenerateWall_SandBrick(tex);
 	
-	for (int y = 10; y < 22; y++) {
-		for (int x = 8; x < 24; x++) {
-			if ((x + y) % 3 == 0 && x > 10 && x < 22 && y > 12 && y < 20) {
+	for (int y = 80; y < 176; y++) {
+		for (int x = 64; x < 192; x++) {
+			if ((x + y) % 24 == 0 && x > 80 && x < 176 && y > 96 && y < 160) {
 				tex[y][x] = (Color){140, 45, 35, 255};
 			}
 		}
@@ -518,7 +940,7 @@ static void GenerateWall_BrickMarked(Color tex[TS][TS]) {
 }
 
 // ------------------------------------------------------------
-//  СЕКТОР 5: ТЕКСТУРЫ ПОЛОВ
+//  ОБНОВЛЕННЫЕ ТЕКСТУРЫ ПОЛОВ (256x256)
 // ------------------------------------------------------------
 
 // Пол 0: Песок (улицы)
@@ -528,10 +950,10 @@ static void GenerateFloor_Sand(Color tex[TS][TS]) {
 	
 	for (int y = 0; y < TS; y++) {
 		for (int x = 0; x < TS; x++) {
-			float n = fbm(x * 0.4f, y * 0.4f, 3);
+			float n = fbm(x * 0.05f, y * 0.05f, 3);
 			Color c = MixColor(sandDark, sandLight, n);
 			
-			if ((hash2(x, y) & 0x7F) < 3) {
+			if ((hash2(x, y) & 0x7F) < 6) {
 				c = MixColor(c, (Color){120, 100, 70, 255}, 0.6f);
 			}
 			
@@ -548,16 +970,16 @@ static void GenerateFloor_SandTile(Color tex[TS][TS]) {
 	
 	for (int y = 0; y < TS; y++) {
 		for (int x = 0; x < TS; x++) {
-			bool isGrout = (x % 16 == 0 || y % 16 == 0);
+			bool isGrout = (x % 128 == 0 || y % 128 == 0); 
 			
 			if (isGrout) {
 				tex[y][x] = grout;
 			} else {
-				int tileX = x / 16;
-				int tileY = y / 16;
+				int tileX = x / 128;
+				int tileY = y / 128;
 				float variance = ((hash2(tileX, tileY) & 0xFF) / 255.0f - 0.5f) * 0.2f;
 				
-				float n = fbm(x * 0.5f, y * 0.5f, 2);
+				float n = fbm(x * 0.1f, y * 0.1f, 2);
 				Color c = MixColor(tileDark, tileLight, n + variance);
 				
 				tex[y][x] = c;
@@ -574,15 +996,15 @@ static void GenerateFloor_StoneTile(Color tex[TS][TS]) {
 	
 	for (int y = 0; y < TS; y++) {
 		for (int x = 0; x < TS; x++) {
-			bool isGrout = (x % 8 == 0 || y % 8 == 0);
+			bool isGrout = (x % 64 == 0 || y % 64 == 0); 
 			
 			if (isGrout) {
 				tex[y][x] = grout;
 			} else {
-				int tx = x / 8;
-				int ty = y / 8;
+				int tx = x / 64;
+				int ty = y / 64;
 				float v = ((hash2(tx + 100, ty + 100) & 0xFF) / 255.0f);
-				float n = fbm(x * 0.6f, y * 0.6f, 2);
+				float n = fbm(x * 0.15f, y * 0.15f, 2);
 				Color c = MixColor(stone, stoneLight, n * 0.5f + v * 0.5f);
 				
 				if (n < 0.3f) c = MixColor(c, (Color){60, 50, 38, 255}, 0.5f);
@@ -599,10 +1021,10 @@ static void GenerateFloor_Gravel(Color tex[TS][TS]) {
 	
 	for (int y = 0; y < TS; y++) {
 		for (int x = 0; x < TS; x++) {
-			float n = fbm(x * 0.7f, y * 0.7f, 3);
+			float n = fbm(x * 0.2f, y * 0.2f, 3);
 			Color c = base;
 			
-			if ((hash2(x, y) & 0x3F) < 6) {
+			if ((hash2(x, y) & 0x3F) < 12) { 
 				unsigned int h = hash2(x, y);
 				int shade = (h >> 8) & 0x3F;
 				c = (Color){
@@ -620,10 +1042,6 @@ static void GenerateFloor_Gravel(Color tex[TS][TS]) {
 	}
 }
 
-// ------------------------------------------------------------
-//  СЕКТОР 6: ТЕКСТУРЫ ПОЛОВ
-// ------------------------------------------------------------
-
 // Пол 4: Деревянный пол (внутри зданий)
 static void GenerateFloor_Wood(Color tex[TS][TS]) {
 	Color wood = (Color){145, 100, 60, 255};
@@ -631,13 +1049,13 @@ static void GenerateFloor_Wood(Color tex[TS][TS]) {
 	
 	for (int y = 0; y < TS; y++) {
 		for (int x = 0; x < TS; x++) {
-			int plank = y / 4;
+			int plank = y / 32; 
 			Color base = (plank % 2 == 0) ? wood : woodDark;
 			
-			float grain = sinf(x * 0.8f + fbm(x * 0.4f, y * 0.6f, 2) * 5.0f) * 0.5f + 0.5f;
+			float grain = sinf(x * 0.1f + fbm(x * 0.05f, y * 0.15f, 2) * 5.0f) * 0.5f + 0.5f;
 			float shade = 0.85f + grain * 0.3f;
 			
-			if (y % 4 == 0) shade *= 0.5f;
+			if (y % 32 == 0) shade *= 0.5f; 
 			
 			tex[y][x] = (Color){
 				(unsigned char)(base.r * shade),
@@ -653,11 +1071,11 @@ static void GenerateFloor_Wood(Color tex[TS][TS]) {
 static void GenerateFloor_SandyStones(Color tex[TS][TS]) {
 	GenerateFloor_Sand(tex);
 	
-	for (int i = 0; i < 20; i++) {
+	for (int i = 0; i < 160; i++) { 
 		unsigned int h = hash2(i * 17, i * 31);
-		int cx = (h >> 0) & 0x1F;
-		int cy = (h >> 8) & 0x1F;
-		int r  = 1 + ((h >> 16) & 1);
+		int cx = (h >> 0) & 0xFF; 
+		int cy = (h >> 8) & 0xFF;
+		int r  = 8 + ((h >> 16) & 7); 
 		
 		for (int dy = -r; dy <= r; dy++) {
 			for (int dx = -r; dx <= r; dx++) {
@@ -681,10 +1099,10 @@ static void GenerateFloor_Dirt(Color tex[TS][TS]) {
 	
 	for (int y = 0; y < TS; y++) {
 		for (int x = 0; x < TS; x++) {
-			float n = fbm(x * 0.5f, y * 0.5f, 3);
+			float n = fbm(x * 0.1f, y * 0.1f, 3);
 			Color c = MixColor(dirt, dirtLight, n);
 			
-			float dark = fbm(x * 0.2f + 30.0f, y * 0.2f, 2);
+			float dark = fbm(x * 0.05f + 30.0f, y * 0.05f, 2);
 			if (dark > 0.7f) {
 				c = MixColor(c, (Color){40, 30, 20, 255}, (dark - 0.7f) * 2.0f);
 			}
@@ -702,21 +1120,23 @@ static void GenerateFloor_RedTile(Color tex[TS][TS]) {
 	
 	for (int y = 0; y < TS; y++) {
 		for (int x = 0; x < TS; x++) {
-			bool isGrout = (x % 16 == 0 || y % 16 == 0);
+			bool isGrout = (x % 128 == 0 || y % 128 == 0); 
 			if (isGrout) {
 				tex[y][x] = grout;
 			} else {
-				float n = fbm(x * 0.4f, y * 0.4f, 2);
+				float n = fbm(x * 0.1f, y * 0.1f, 2);
 				tex[y][x] = MixColor(tileDark, tile, n);
 			}
 		}
 	}
 }
 
+// Собираем все текстуры в кучу
 static void ApplyDirt(Color tex[TS][TS], float intensity, Color dirtColor) {
 	for (int y = 0; y < TS; y++) {
 		for (int x = 0; x < TS; x++) {
-			float n = fbm(x * 0.15f + 50.0f, y * 0.15f + 50.0f, 3);
+			// Частоту шума уменьшили для 256x256
+			float n = fbm(x * 0.05f + 50.0f, y * 0.05f + 50.0f, 3);
 			if (n > 0.5f) {
 				float t = (n - 0.5f) * 2.0f * intensity;
 				if (t > 1.0f) t = 1.0f;
@@ -728,24 +1148,22 @@ static void ApplyDirt(Color tex[TS][TS], float intensity, Color dirtColor) {
 			int g = (int)tex[y][x].g + noise;
 			int b = (int)tex[y][x].b + noise;
 			
-			// НОВОЕ: Увеличиваем контраст (тени становятся чернее, света ярче)
+			// Увеличиваем контраст (тени становятся чернее, света ярче)
 			float contrast = 1.25f;
 			r = (int)((r - 128) * contrast + 128);
 			g = (int)((g - 128) * contrast + 128);
 			b = (int)((b - 128) * contrast + 128);
 			
-			if (r < 0) r = 0; if (r > 255) r = 255;
-			if (g < 0) g = 0; if (g > 255) g = 255;
-			if (b < 0) b = 0; if (b > 255) b = 255;
-			
+			if (r < 0) { r = 0; } if (r > 255) { r = 255; }
+			if (g < 0) { g = 0; } if (g > 255) { g = 255; }
+			if (b < 0) { b = 0; } if (b > 255) { b = 255; }
+
 			tex[y][x].r = (unsigned char)r;
 			tex[y][x].g = (unsigned char)g;
 			tex[y][x].b = (unsigned char)b;
 		}
 	}
 }
-
-// Собираем все текстуры в кучу
 static void GenerateSky(void); // <-- Добавь эту строчку
 void GenerateAllTextures(void) {
 	Color dirtBrown = (Color){40, 30, 20, 255}; // Цвет грязи
@@ -1236,6 +1654,39 @@ void SpawnBulletHole(float startX, float startY, float startZ, float dirX, float
 			}
 			return;
 		}
+
+		// ПРОВЕРКА ПОПАДАНИЯ В ИГРОКА
+		for (int i = 0; i < MAX_NET_PLAYERS; i++) {
+			if (i == myPlayerID || netPlayers[i].isDead) continue;
+			
+			// Координаты игрока
+			float dxP = netPlayers[i].x - startX;
+			float dyP = netPlayers[i].y - startY;
+			
+			// Проекция на луч (расстояние от камеры до игрока)
+			float projDistP = dxP * dirX + dyP * dirY;
+			
+			// Если игрок впереди и ближе, чем стена (perpDist)
+			if (projDistP > 0 && projDistP < perpDist) {
+				// Расстояние от луча до центра игрока (перпендикуляр)
+				float sideDistP = fabsf(dxP * (-dirY) + dyP * dirX);
+				
+				// Если луч прошел близко к центру (радиус Тофу ~0.4f)
+				if (sideDistP < 0.4f) {
+					netPlayers[i].health -= 25;
+					
+					if (netPlayers[i].health <= 0) {
+						netPlayers[i].isDead = true;
+						if (sndDeath.frameCount > 0) PlaySound(sndDeath);
+					} else {
+						if (sndHit.frameCount > 0) PlaySound(sndHit);
+					}
+					
+					SendEvent(PKT_HIT, i, 25);
+					return; // Пуля попала в игрока, дальше не летит
+				}
+			}
+		}
 		
 		// Попадание в стену или ящик
 		if (c->type == CELL_WALL || c->type == CELL_CRATE) {
@@ -1446,37 +1897,46 @@ void FireWeapon(void) {
 	float wl = sqrtf(wx * wx + wy * wy);
 	if (wl > 0.001f) { wx /= wl; wy /= wl; }
 	
-	// --- СИСТЕМА СТАМИНЫ ---
-	bool isMoving = (wl > 0.001f);
-	bool wantsToSprint = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
-	bool isSprinting = false;
-	
-	float maxSpeed = 2.4f; 
-	
-	if (wantsToSprint && isMoving && player.stamina > 0.0f) {
-		isSprinting = true;
-		maxSpeed *= 1.6f; 
-		player.stamina -= 25.0f * dt; 
-		if (player.stamina < 0.0f) player.stamina = 0.0f;
-	} else {
-		player.stamina += 15.0f * dt;
-		if (player.stamina > player.maxStamina) player.stamina = player.maxStamina;
-	}
-	
-	if (isSprinting || player.stamina < player.maxStamina) {
-		stamina_ui_timer = 2.0f;
-	}
-		// --- ЗВУКИ СТАМИНЫ ---
-		// 1. Игрок выдохся до нуля (играем тяжелый выдох)
-		if (player.stamina <= 0.1f && !isFullyExhausted) {
-			if (sndStaminaOut.frameCount > 0) PlaySound(sndStaminaOut);
-			isFullyExhausted = true; // Запоминаем, что мы устали
+
+			// --- СИСТЕМА СТАМИНЫ ---
+		bool isMoving = (wl > 0.001f);
+		bool wantsToSprint = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+		bool isSprinting = false;
+		
+		float maxSpeed = 2.4f; 
+		
+		// Логика скорости
+		if (isFullyExhausted) {
+			maxSpeed *= 0.55f; // Медленная ходьба при истощении
+		} else if (wantsToSprint && isMoving && player.stamina > 0.0f) {
+			isSprinting = true;
+			maxSpeed *= 1.6f; 
+			player.stamina -= 25.0f * dt; 
+			if (player.stamina < 0.0f) player.stamina = 0.0f;
 		}
 		
-		// 2. Игрок полностью восстановился (играем вдох)
-		if (player.stamina >= player.maxStamina - 0.1f && isFullyExhausted) {
+		// Восстановление стамины
+		if (!isSprinting) {
+			float regenRate = isFullyExhausted ? 10.0f : 15.0f;
+			player.stamina += regenRate * dt;
+			if (player.stamina > player.maxStamina) player.stamina = player.maxStamina;
+		}
+		
+		if (isSprinting || player.stamina < player.maxStamina) {
+			stamina_ui_timer = 2.0f;
+		}
+		
+		// --- ЗВУКИ СТАМИНЫ И ВЫХОД ИЗ ИСТОЩЕНИЯ ---
+		// 1. Упали в ноль
+		if (player.stamina <= 0.1f && !isFullyExhausted) {
+			if (sndStaminaOut.frameCount > 0) PlaySound(sndStaminaOut);
+			isFullyExhausted = true; 
+		}
+		
+		// 2. Восстановились (например, до 40%, чтобы снова можно было бегать)
+		if (player.stamina >= player.maxStamina * 0.4f && isFullyExhausted) {
 			if (sndStaminaBack.frameCount > 0) PlaySound(sndStaminaBack);
-			isFullyExhausted = false; // Сбрасываем усталость
+			isFullyExhausted = false; 
 		}
 	
 	// --- ФИЗИКА ---
@@ -1505,10 +1965,12 @@ void FireWeapon(void) {
 		}
 	}
 	
-	if (IsKeyDown(KEY_SPACE) && player.onGround) { 
-		player.vz = JUMP_SPEED * 1.15f; 
-		player.onGround = false; 
-	}
+		if (IsKeyDown(KEY_SPACE) && player.onGround && !isFullyExhausted && player.stamina >= 15.0f) {
+			player.vz = JUMP_SPEED * 1.15f; 
+			player.onGround = false; 
+			player.stamina -= 15.0f;
+			stamina_ui_timer = 2.0f;
+		}
 	
 	player.vz += GRAVITY * dt; 
 	player.z += player.vz * dt;
@@ -1611,119 +2073,6 @@ void FireWeapon(void) {
 }
 
 // ------------------------------------------------------------
-//  ФИЛЬТР VHS/PS2 (ОПТИМИЗИРОВАННЫЙ: LUT + FIXED-POINT + OMP)
-// ------------------------------------------------------------
-void ApplyPS2Filter(Color *pixels) {
-	static bool lutInitialized = false;
-	static uint16_t vignetteLUT[SH][SW]; // Фиксированная точка 0..256
-	static int8_t   noiseLUT[256][256];  // Предвычисленный шум -15..+14
-	static uint8_t  clampLUT[1024];      // Быстрый clamp без ветвлений (смещение +256)
-	
-	// 1. Однократная инициализация таблиц при первом кадре
-	if (!lutInitialized) {
-		float halfW = SW * 0.5f;
-		float halfH = SH * 0.5f;
-		float maxDist = sqrtf(halfW * halfW + halfH * halfH);
-		
-		for (int y = 0; y < SH; y++) {
-			float dy = (float)y - halfH;
-			float dy2 = dy * dy;
-			for (int x = 0; x < SW; x++) {
-				float dx = (float)x - halfW;
-				float dist = sqrtf(dx * dx + dy2);
-				float vig = 1.0f - (dist / maxDist) * 0.8f;
-				if (vig < 0.0f) vig = 0.0f;
-				vignetteLUT[y][x] = (uint16_t)(vig * 256.0f);
-			}
-		}
-		
-		for (int y = 0; y < 256; y++) {
-			for (int x = 0; x < 256; x++) {
-				noiseLUT[y][x] = (int8_t)((hash2(x, y) % 30) - 15);
-			}
-		}
-		
-		for (int i = 0; i < 1024; i++) {
-			int val = i - 256;
-			if (val < 0) val = 0;
-			else if (val > 255) val = 255;
-			clampLUT[i] = (uint8_t)val;
-		}
-		
-		lutInitialized = true;
-	}
-	
-	static const int8_t bayer[4][4] = {
-		{ -8,  0, -6,  2 },
-		{  4, -4,  6, -2 },
-		{ -5,  3, -7,  1 },
-		{  7, -1,  5, -3 }
-	};
-	
-	// Случайный сдвиг тайла шума для каждого кадра (дешево и без GetTime/float)
-	static uint32_t frameSeed = 0;
-	frameSeed = frameSeed * 1664525u + 1013904223u;
-	uint8_t noiseOffX = (uint8_t)(frameSeed >> 16);
-	uint8_t noiseOffY = (uint8_t)(frameSeed >> 24);
-	
-	// 2. Многопоточный проход по строкам
-	#pragma omp parallel for num_threads(cpu_threads) schedule(static)
-	for (int y = 0; y < SH; y++) {
-		Color *row = pixels + y * SW;
-		Color srcRow[SW];
-		memcpy(srcRow, row, SW * sizeof(Color)); // Копируем строку в L1-кэш (убирает баг перезаписи CA)
-		
-		const uint16_t *vigRow = vignetteLUT[y];
-		const int8_t *bayerRow = bayer[y & 3];
-		const int8_t *noiseRow = noiseLUT[(uint8_t)(y + noiseOffY)];
-		uint32_t scanlineMul = (y & 1) ? 256 : 218; // 0.85 * 256 ≈ 218 для четных строк
-		
-		for (int x = 0; x < SW; x++) {
-			Color c = srcRow[x];
-			
-			// Хроматическая аберрация только по краям экрана (левые/правые 25%), в центре — бесплатно
-			if (x < 270 || x > SW - 270) {
-				int r_x = (x > 0) ? (x - 1) : 0;
-				int b_x = (x < SW - 1) ? (x + 1) : (SW - 1);
-				c.r = srcRow[r_x].r;
-				c.b = srcRow[b_x].b;
-			}
-			
-			// Целочисленная цветокоррекция (Desaturate 40% + грязный оттенок Buckshot Roulette)
-			// gray ≈ (r + g + b) * 85 >> 8
-			int gray = ((c.r + c.g + c.b) * 85) >> 8;
-			// 0.6 * 256 = 154, 0.4 * 256 = 102
-			int r = (c.r * 154 + gray * 102) >> 8;
-			int g = (c.g * 154 + gray * 102) >> 8;
-			int b = (c.b * 154 + gray * 102) >> 8;
-			
-			// Тинт: R * 0.95 (243/256), G * 1.0, B * 0.85 (218/256)
-			r = (r * 243) >> 8;
-			b = (b * 218) >> 8;
-			
-			// Дизеринг Байера (быстрая битовая маска & 3 вместо % 4)
-			int dither = bayerRow[x & 3];
-			r = clampLUT[r + dither + 256];
-			g = clampLUT[g + dither + 256];
-			b = clampLUT[b + dither + 256];
-			
-			// Объединяем скан-линию и виньетку в один множитель (0..256)
-			uint32_t darkMul = (vigRow[x] * scanlineMul) >> 8;
-			r = (r * darkMul) >> 8;
-			g = (g * darkMul) >> 8;
-			b = (b * darkMul) >> 8;
-			
-			// Зерно из 256x256 LUT + финальный clamp без if-ветвлений
-			int grain = noiseRow[(uint8_t)(x + noiseOffX)];
-			row[x].r = clampLUT[r + grain + 256];
-			row[x].g = clampLUT[g + grain + 256];
-			row[x].b = clampLUT[b + grain + 256];
-		}
-	}
-}
-
-
-// ------------------------------------------------------------
 //  СЕКТОР 11: РЕНДЕР (ПОЛНОСТЬЮ ИСПРАВЛЕННЫЙ, МОНОЛИТНЫЙ)
 // ------------------------------------------------------------
 
@@ -1752,10 +2101,19 @@ void RenderFrame(Color *pixels) {
 	int moonY = (int)(horizon - 250.0f); 
 	int moonR = 40;
 	
-	// ===== ПРОХОД 1: DDA (СТЕНЫ) =====
-	#pragma omp parallel for num_threads(cpu_threads) schedule(static)
+// ===== ПРОХОД 1: DDA (СТЕНЫ + ПРЕДРАСЧЁТ НЕБА) =====
+#pragma omp parallel for num_threads(cpu_threads) schedule(static)
 	for (int x = 0; x < SW; x++) {
-		float camXc = 2.0f * ((float)x / (float)SW) - 1.0f + bobH / (float)SW;
+		// 1. Предрасчёт координаты неба один раз на столбец
+		float rawCamXc = 2.0f * ((float)x / (float)SW) - 1.0f;
+		float normAngle = fmodf(player.pa + rawCamXc * (fov * 0.5f), 2.0f * PI);
+		if (normAngle < 0.0f) normAngle += 2.0f * PI;
+		int sX = (int)((normAngle / (2.0f * PI)) * (float)SKY_W);
+		if (sX < 0) sX = 0; else if (sX >= SKY_W) sX = SKY_W - 1;
+		skyXBuf[x] = sX;
+		
+		// 2. DDA для стен
+		float camXc = rawCamXc + bobH / (float)SW;
 		float rayDirX = dirX + planeX * camXc, rayDirY = dirY + planeY * camXc;
 		int mapX = (int)floorf(camX), mapY = (int)floorf(camY);
 		
@@ -1781,21 +2139,11 @@ void RenderFrame(Color *pixels) {
 		zbuf[x] = perpDist;
 		
 		float wallFloorZ = Z_FLOOR, wallCeilZ = Z_CEIL; int wallTexID = 0;
-				// --- НАПРАВЛЕННЫЙ СВЕТ ---
 		float lightMultiplier = 1.0f;
-		if (side == 0) {
-			// Вертикальные стены (Запад/Восток)void GenerateAllTextures(void) {
-			if (rayDirX > 0) lightMultiplier = 0.65f; // Западные (в тени)
-			else lightMultiplier = 1.0f;              // Восточные (светлые)
-		} else {
-			// Горизонтальные стены (Север/Юг)
-			if (rayDirY > 0) lightMultiplier = 0.65f; // Северные (в тени)
-			else lightMultiplier = 1.0f;              // Южные (светлые)
-		}
-		lightBuf[x] = lightMultiplier; // <-- ДОБАВИТЬ ВОТ ЭТО
+		if (side == 0) lightMultiplier = (rayDirX > 0) ? 0.65f : 1.0f;
+		else           lightMultiplier = (rayDirY > 0) ? 0.65f : 1.0f;
+		lightBuf[x] = lightMultiplier;
 		
-		// Применяем этот множитель к базовому затенению (которое считается позже)
-		// (Если у тебя shade считается в проходе 2, мы передадим lightMultiplier туда).
 		if (mapX >= 0 && mapX < MW && mapY >= 0 && mapY < MH) {
 			Cell *c = &map[mapX][mapY]; 
 			wallFloorZ = c->floorZ; wallCeilZ = c->ceilZ; wallTexID = c->wallTex;
@@ -1820,88 +2168,155 @@ void RenderFrame(Color *pixels) {
 		txBuf[x] = tx; sideBuf[x] = side; perpBuf[x] = perpDist;
 	}
 	
-	// ===== ПРОХОД 2: РАСТЕРИЗАЦИЯ (СТЕНЫ И ПОЛ) =====
-#pragma omp parallel for num_threads(cpu_threads)
+	// ===== ПРОХОД 2: РАСТЕРИЗАЦИЯ В ОДИН ПРОХОД ПО X (БЕЗ ПЕРЕКРЫТИЯ НЕБА) =====
+	float radiusSq = (float)(moonR * moonR);
+	float glowRadiusSq = radiusSq * 2.5f;
+	float invMoonR = 1.0f / (float)moonR;
+	
+#pragma omp parallel for num_threads(cpu_threads) schedule(dynamic, 8)
 	for (int y = 0; y < SH; y++) {
 		Color *row = pixels + y * SW;
 		int skyY = (int)((float)y - horizon + SKY_H * 0.5f);
-		if (skyY < 0) skyY = 0; if (skyY >= SKY_H) skyY = SKY_H - 1;
+		if (skyY < 0) { skyY = 0; }
+		if (skyY >= SKY_H) { skyY = SKY_H - 1; }
+		const Color *skyRow = skyTex[skyY];
 		
-		for (int x = 0; x < SW; x++) {
-			float camXc = 2.0f * ((float)x / (float)SW) - 1.0f;
-			float rayAngle = player.pa + camXc * (fov * 0.5f);
-			float normAngle = rayAngle;
-			while (normAngle < 0.0f) normAngle += 2.0f * PI;
-			while (normAngle >= 2.0f * PI) normAngle -= 2.0f * PI;
-			
-			int skyX = (int)((normAngle / (2.0f * PI)) * (float)SKY_W);
-			if (skyX < 0) skyX = 0; if (skyX >= SKY_W) skyX = SKY_W - 1;
-			
-			int dx = x - moonX; int dy = y - moonY;
-			float distSq = (float)(dx*dx + dy*dy);
-			float radiusSq = (float)(moonR * moonR);
-			
-			if (distSq < radiusSq) {
-				float nx = (float)dx / (float)moonR; float ny = (float)dy / (float)moonR;
-				float distFromCenter = sqrtf(nx*nx + ny*ny);
-				float shading = 1.0f - (distFromCenter * 0.3f);
-				float craterNoise = fbm(nx * 3.0f + 10.0f, ny * 3.0f + 10.0f, 3);
-				float craterDarkness = (craterNoise > 0.45f && craterNoise < 0.6f) ? 0.25f : 0.1f;
-				row[x] = (Color){ (unsigned char)(240 * shading * (1.0f - craterDarkness)), (unsigned char)(240 * shading * (1.0f - craterDarkness)), (unsigned char)(220 * shading * (1.0f - craterDarkness * 0.8f)), 255 };
-			} else if (distSq < radiusSq * 2.5f) {
-				float glowFactor = 1.0f - (sqrtf(distSq) - (float)moonR) / ((float)moonR * 1.5f);
-				if (glowFactor < 0.0f) glowFactor = 0.0f;
-				Color skyCol = skyTex[skyY][skyX];
-				row[x] = (Color){ (unsigned char)(skyCol.r + (100 - skyCol.r) * glowFactor * 0.4f), (unsigned char)(skyCol.g + (120 - skyCol.g) * glowFactor * 0.4f), (unsigned char)(skyCol.b + (160 - skyCol.b) * glowFactor * 0.4f), 255 };
-			} else {
-				row[x] = skyTex[skyY][skyX];
-			}
+		int dyMoon = y - moonY;
+		float dyMoonSq = (float)(dyMoon * dyMoon);
+		bool moonNearY = (dyMoonSq < glowRadiusSq);
+		
+		// Предрасчёт дистанции пола для всей строки Y (одно деление вместо 1080 делений!)
+		float p = (float)y - horizon;
+		bool hasFloor = (p > 0.0f);
+		float rd = 0.0f, fshade = 0.2f;
+		if (hasFloor) {
+			rd = (camZ - Z_FLOOR) * projPlane / p;
+			if (rd > depth) rd = depth;
+			fshade = 1.0f - (rd / depth) * 0.85f;
+			if (fshade < 0.2f) fshade = 0.2f;
 		}
 		
 		for (int x = 0; x < SW; x++) {
 			int ds = drawStartBuf[x], de = drawEndBuf[x];
-			if (y >= ds && y < de) {
+			
+			if (y < ds) {
+				// --- 1. НЕБО И ЛУНА (рисуем только выше стены!) ---
+				int skyX = skyXBuf[x];
+				Color c = skyRow[skyX];
+				
+				if (moonNearY) {
+					int dx = x - moonX;
+					float distSq = (float)(dx * dx) + dyMoonSq;
+					if (distSq < radiusSq) {
+						float nx = (float)dx * invMoonR;
+						float ny = (float)dyMoon * invMoonR;
+						float shading = 1.0f - sqrtf(nx * nx + ny * ny) * 0.3f;
+						float craterNoise = fbm(nx * 3.0f + 10.0f, ny * 3.0f + 10.0f, 2);
+						float craterDark = (craterNoise > 0.45f && craterNoise < 0.6f) ? 0.25f : 0.1f;
+						float mul = shading * (1.0f - craterDark);
+						c = (Color){ (unsigned char)(240 * mul), (unsigned char)(240 * mul), (unsigned char)(220 * shading * (1.0f - craterDark * 0.8f)), 255 };
+					} else if (distSq < glowRadiusSq) {
+						float glow = 1.0f - (sqrtf(distSq) - (float)moonR) / ((float)moonR * 1.5f);
+						if (glow > 0.0f) {
+							float g4 = glow * 0.4f;
+							c.r = (unsigned char)(c.r + (100 - c.r) * g4);
+							c.g = (unsigned char)(c.g + (120 - c.g) * g4);
+							c.b = (unsigned char)(c.b + (160 - c.b) * g4);
+						}
+					}
+				}
+				row[x] = c;
+			} 
+			else if (y < de) {
+				// --- 2. СТЕНА ---
 				int lineHeight = rawEndBuf[x] - rawStartBuf[x];
 				if (lineHeight < 1) lineHeight = 1;
 				int ty = (int)(((float)(y - rawStartBuf[x]) / (float)lineHeight) * TS);
-				if (ty < 0) ty = 0; if (ty >= TS) ty = TS - 1;
+				if (ty < 0) ty = 0; else if (ty >= TS) ty = TS - 1;
+				
 				Color c = wallTex[texIDBuf[x]][ty][txBuf[x]];
 				float shade = 1.0f - (perpBuf[x] / depth) * 0.85f;
 				if (shade < 0.2f) shade = 0.2f;
-				shade *= lightBuf[x]; // <-- Применяем направленный свет!
+				shade *= lightBuf[x];
 				if (sideBuf[x] == 1) shade *= 0.75f;
-				c.r = (unsigned char)(c.r * shade); c.g = (unsigned char)(c.g * shade); c.b = (unsigned char)(c.b * shade);
-				row[x] = c;
-			} else if (y > de) {
+				
+				row[x] = (Color){ (unsigned char)(c.r * shade), (unsigned char)(c.g * shade), (unsigned char)(c.b * shade), 255 };
+			} 
+			else if (hasFloor) {
+				// --- 3. ПОЛ (без деления внутри цикла по X) ---
 				float camXc = 2.0f * ((float)x / (float)SW) - 1.0f;
-				float rayDirX = dirX + planeX * camXc, rayDirY = dirY + planeY * camXc;
-				float p = (float)y - horizon;
-				float tanAngle = (p / projPlane);
-				if (tanAngle > 0.0f) {
-					float rd = (camZ - Z_FLOOR) / tanAngle;
-					if (rd > depth) rd = depth;
-					float floorX = camX + rayDirX * rd, floorY = camY + rayDirY * rd;
-					int cellX = (int)floorf(floorX), cellY = (int)floorf(floorY);
-					int ftex = 0;
-					if (cellX >= 0 && cellX < MW && cellY >= 0 && cellY < MH) {
-						ftex = map[cellX][cellY].floorTex;
-						if (ftex >= N_FLOOR_TEX) ftex = 0;
-					}
-					int ftx = (int)((floorX - (float)cellX) * (float)TS);
-					if (ftx < 0) ftx = 0; if (ftx >= TS) ftx = TS - 1;
-					int fty = (int)((floorY - (float)cellY) * (float)TS);
-					if (fty < 0) fty = 0; if (fty >= TS) fty = TS - 1;
-					Color c = floorTex[ftex][fty][ftx];
-					float fshade = 1.0f - (rd / depth) * 0.85f;
-					if (fshade < 0.2f) fshade = 0.2f;
-					c.r = (unsigned char)(c.r * fshade); c.g = (unsigned char)(c.g * fshade); c.b = (unsigned char)(c.b * fshade);
-					row[x] = c;
+				float floorX = camX + (dirX + planeX * camXc) * rd;
+				float floorY = camY + (dirY + planeY * camXc) * rd;
+				
+				int cellX = (int)floorf(floorX), cellY = (int)floorf(floorY);
+				int ftex = 0;
+				if (cellX >= 0 && cellX < MW && cellY >= 0 && cellY < MH) {
+					ftex = map[cellX][cellY].floorTex;
+					if (ftex >= N_FLOOR_TEX) ftex = 0;
 				}
+				int ftx = (int)((floorX - (float)cellX) * (float)TS) & (TS - 1);
+				int fty = (int)((floorY - (float)cellY) * (float)TS) & (TS - 1);
+				
+				Color c = floorTex[ftex][fty][ftx];
+				row[x] = (Color){ (unsigned char)(c.r * fshade), (unsigned char)(c.g * fshade), (unsigned char)(c.b * fshade), 255 };
 			}
 		}
 	}
 	
 // ===== ПРОХОД 3: ПЛАВНОЕ ЗАТУХАНИЕ СПРАЙТОВ (НЕЛИНЕЙНЫЙ МАСШТАБ + ALPHA FADE) =====
+	
+// 3. ОТРИСОВКА ДРУГИХ ИГРОКОВ (ТОФУ)
+	for (int i = 0; i < MAX_NET_PLAYERS; i++) {
+		if (i == myPlayerID || netPlayers[i].isDead) continue; 
+		if (netPlayers[i].x == 0 && netPlayers[i].y == 0) continue; // Пустой слот
+		
+		float dx = netPlayers[i].x - camX;
+		float dy = netPlayers[i].y - camY;
+		float projDist = dx * dirX + dy * dirY;
+		
+		if (projDist < 0.2f || projDist > depth) continue; 
+		
+		float sideDist = dx * (-dirY) + dy * dirX;
+		float camXc = sideDist / (projDist * planeLen);
+		float screenX = (camXc + 1.0f) * ((float)SW * 0.5f) - (bobH * 0.5f);
+		int px = (int)screenX;
+		
+		if (px < 0 || px >= SW) continue;
+		if (projDist > zbuf[px] + 0.2f) continue;
+		
+		float spriteH = (1.7f / projDist) * projPlane;
+		float spriteW = (0.5f / projDist) * projPlane;
+		
+		int py = (int)((float)horizon - (netPlayers[i].z - camZ) / projDist * projPlane);
+		
+		int startX = px - (int)(spriteW / 2);
+		int endX = px + (int)(spriteW / 2);
+		int startY = py - (int)spriteH;
+		int endY = py;
+		
+		for (int sy = startY; sy < endY; sy++) {
+			if (sy < 0 || sy >= SH) continue;
+			for (int sx = startX; sx < endX; sx++) {
+				if (sx < 0 || sx >= SW) continue;
+				if (projDist > zbuf[sx]) continue; 
+				
+				int texX = (int)((float)(sx - startX) / spriteW * TOFU_SIZE);
+				int texY = (int)((float)(sy - startY) / spriteH * TOFU_SIZE);
+				if (texX < 0) { texX = 0; }
+				if (texX >= TOFU_SIZE) { texX = TOFU_SIZE - 1; }
+				if (texY < 0) { texY = 0; }
+				if (texY >= TOFU_SIZE) { texY = TOFU_SIZE - 1; }
+				
+				
+				Color c = tofuData[netPlayers[i].faceID][texY][texX];
+				if (c.a == 0) continue;
+				
+				float shade = 1.0f - (projDist / depth) * 0.85f;
+				if (shade < 0.2f) shade = 0.2f;
+				pixels[sy * SW + sx] = (Color){ c.r * shade, c.g * shade, c.b * shade, 255 };
+			}
+		}
+	}
 	
 	// 1. ОТРЕСОВКА ДЫРОК ОТ ПУЛЬ
 	for (int i = 0; i < MAX_BULLETS; i++) {
@@ -2162,48 +2577,84 @@ void DrawMiniMap(RenderTexture2D minimapRT) {
 	EndTextureMode();
 }
 
-void DrawMainMenu(void) {
-	ClearBackground((Color){15, 15, 15, 255}); // Почти черный фон
+	bool isFullscreen = false;
+	void ToggleScreenMode(void) {
+		isFullscreen = !isFullscreen;
+		if (isFullscreen) {
+			int monitor = GetCurrentMonitor();
+			int monW = GetMonitorWidth(monitor);
+			int monH = GetMonitorHeight(monitor);
+			SetWindowSize(monW, monH);
+			if (!IsWindowFullscreen()) ToggleFullscreen();
+		} else {
+			if (IsWindowFullscreen()) ToggleFullscreen();
+			SetWindowSize(SW, SH);
+			int monitor = GetCurrentMonitor();
+			SetWindowPosition(
+							  (GetMonitorWidth(monitor) - SW) / 2,
+							  (GetMonitorHeight(monitor) - SH) / 2
+							  );
+		}
+	}
 	
-	// Заголовок
-	const char* title = "BATTLE SIMULATION";
-	int titleSize = 60;
-	int titleWidth = MeasureText(title, titleSize);
-	int titleX = SW/2 - titleWidth/2;
-	int titleY = SH/3;
+	void DrawMainMenu(void) {
+		int curW = GetScreenWidth();
+		int curH = GetScreenHeight();
+		
+		ClearBackground((Color){15, 15, 15, 255});
+		
+		// Заголовок
+		const char* title = "BATTLE SIMULATION";
+		int titleSize = 60;
+		int titleWidth = MeasureText(title, titleSize);
+		int titleX = curW / 2 - titleWidth / 2;
+		int titleY = curH / 3 - 30;
+		
+		DrawText(title, titleX + 3, titleY + 3, titleSize, (Color){50, 45, 30, 255});
+		DrawText(title, titleX, titleY, titleSize, (Color){220, 200, 150, 255});
+		
+		const char* subtitle = "in hard times";
+		int subWidth = MeasureText(subtitle, 20);
+		DrawText(subtitle, curW / 2 - subWidth / 2, titleY + 70, 20, (Color){150, 140, 110, 255});
+		
+		// Кнопки
+		const char* playText   = "START";
+		const char* screenText = isFullscreen ? "DISPLAY: FULLSCREEN" : "DISPLAY: WINDOWED";
+		const char* exitText   = "EXIT";
+		
+		int playWidth   = MeasureText(playText, 36);
+		int screenWidth = MeasureText(screenText, 36);
+		int exitWidth   = MeasureText(exitText, 36);
+		
+		int playY   = curH / 2 + 20;
+		int screenY = curH / 2 + 80;
+		int exitY   = curH / 2 + 140;
+		
+		Color activeCol = (Color){255, 230, 150, 255};
+		Color idleCol   = (Color){80, 75, 60, 255};
+		
+		// 0: PLAY
+		Color playColor = (menuSelection == 0) ? activeCol : idleCol;
+		DrawText(playText, curW / 2 - playWidth / 2, playY, 36, playColor);
+		if (menuSelection == 0) DrawText(">", curW / 2 - playWidth / 2 - 35, playY, 36, playColor);
+		
+		// 1: DISPLAY
+		Color screenColor = (menuSelection == 1) ? activeCol : idleCol;
+		DrawText(screenText, curW / 2 - screenWidth / 2, screenY, 36, screenColor);
+		if (menuSelection == 1) DrawText(">", curW / 2 - screenWidth / 2 - 35, screenY, 36, screenColor);
+		
+		// 2: EXIT
+		Color exitColor = (menuSelection == 2) ? activeCol : idleCol;
+		DrawText(exitText, curW / 2 - exitWidth / 2, exitY, 36, exitColor);
+		if (menuSelection == 2) DrawText(">", curW / 2 - exitWidth / 2 - 35, exitY, 36, exitColor);
+		
+		// Подсказка внизу
+		const char* hint = "W / S - NAVIGATE   |   ENTER - SELECT";
+		int hintWidth = MeasureText(hint, 15);
+		DrawText(hint, curW / 2 - hintWidth / 2, curH - 50, 15, (Color){60, 60, 60, 255});
+	}
 	
-	// Тень для текста (эффект старого монитора)
-	DrawText(title, titleX + 3, titleY + 3, titleSize, (Color){50, 45, 30, 255});
-	DrawText(title, titleX, titleY, titleSize, (Color){220, 200, 150, 255}); // Желтоватый текст
 	
-	const char* subtitle = "in hard times";
-	int subWidth = MeasureText(subtitle, 20);
-	DrawText(subtitle, SW/2 - subWidth/2, titleY + 70, 20, (Color){150, 140, 110, 255});
-	
-	// Кнопки
-	const char* playText = "PLAY";
-	const char* exitText = "EXIT";
-	int playWidth = MeasureText(playText, 40);
-	int exitWidth = MeasureText(exitText, 40);
-	
-	int playY = SH/2 + 50;
-	int exitY = SH/2 + 130;
-	
-	// Кнопка PLAY
-	Color playColor = (menuSelection == 0) ? (Color){255, 230, 150, 255} : (Color){80, 75, 60, 255};
-	DrawText(playText, SW/2 - playWidth/2, playY, 40, playColor);
-	if (menuSelection == 0) DrawText(">", SW/2 - playWidth/2 - 40, playY, 40, playColor);
-	
-	// Кнопка EXIT
-	Color exitColor = (menuSelection == 1) ? (Color){255, 230, 150, 255} : (Color){80, 75, 60, 255};
-	DrawText(exitText, SW/2 - exitWidth/2, exitY, 40, exitColor);
-	if (menuSelection == 1) DrawText(">", SW/2 - exitWidth/2 - 40, exitY, 40, exitColor);
-	
-	// Подсказка внизу
-	const char* hint = "W / S - NAVIGATE   |   ENTER - SELECT";
-	int hintWidth = MeasureText(hint, 15);
-	DrawText(hint, SW/2 - hintWidth/2, SH - 50, 15, (Color){60, 60, 60, 255});
-}
 
 // ------------------------------------------------------------
 //  GLSL ШЕЙДЕР
@@ -2289,11 +2740,18 @@ static const char *ps2FragmentShader =
 "    finalColor = vec4(clamp(col, 0.0, 1.0), 1.0) * fragColor;\n"
 "}\n";
 
-int main(void) {
+	int main(void) {
+		
+		srand((unsigned int)time(NULL));
+		
+	
 	InitWindow(SW, SH, "Battle simulation in hard times");
+	SetExitKey(KEY_NULL);
 	InitAudioDevice();
 	GenerateAllTextures();
+	GenerateTofuTextures();
 	GenMap();
+		
 	
 	// --- ЗАГРУЗКА СПРАЙТОВ ГЛОКА ---
 	pistol.texIdle   = LoadTexture("pistol_anim/glock_idle.png");
@@ -2310,11 +2768,12 @@ int main(void) {
 	if (hasMusic) { PlayMusicStream(music); music.looping = true; SetMusicVolume(music, music_volume); }
 	
 	// --- ЗАГРУЗКА ЗВУКОВ ---
+	sndHit               = LoadSound("soundfiles/hit.mp3");    // <-- ДОБАВИТЬ
+	sndDeath             = LoadSound("soundfiles/death.mp3");  // <-- ДОБАВИТЬ
 	pistol.sndShot        = LoadSound("soundfiles/shot_pistol.mp3");
 	pistol.sndReloadStart = LoadSound("soundfiles/reload_pistol_start.mp3");
 	pistol.sndReloadEnd   = LoadSound("soundfiles/reload_pistol_end.mp3");
 	pistol.sndEmpty       = LoadSound("soundfiles/nobullets_pistol.mp3");
-	
 	sndShellFloor        = LoadSound("soundfiles/gilza_padaet.mp3");
 	sndWallImpactBeton   = LoadSound("soundfiles/shot_beton.mp3");
 	sndWallImpactDerevo  = LoadSound("soundfiles/shot_derevo.mp3");
@@ -2372,57 +2831,171 @@ int main(void) {
 		if (hasMusic) UpdateMusicStream(music);
 		
 		// ============================================================
-		// 1. ЛОГИКА (МЕНЮ, ПЕРЕХОД, ИГРА, ПАУЗА)
+		// 1. ЛОГИКА (МЕНЮ, ЛОББИ, СПИСОК СЕРВЕРОВ, ИГРА)
 		// ============================================================
 		if (currentState == STATE_MENU) {
 			if (IsKeyPressed(KEY_W) || IsKeyPressed(KEY_UP)) menuSelection--;
 			if (IsKeyPressed(KEY_S) || IsKeyPressed(KEY_DOWN)) menuSelection++;
-			if (menuSelection < 0) menuSelection = 1;
-			if (menuSelection > 1) menuSelection = 0;
+			if (menuSelection < 0) menuSelection = 2;
+			if (menuSelection > 2) menuSelection = 0;
 			
 			if (IsKeyPressed(KEY_ENTER)) {
 				if (menuSelection == 0) {
+					menuSelection = 0;
+					currentState = STATE_LOBBY;
+				} else if (menuSelection == 1) {
+					ToggleScreenMode();
+				} else if (menuSelection == 2) {
+					break;
+				}
+			}
+		}
+		else if (currentState == STATE_LOBBY) {
+			if (IsKeyPressed(KEY_W) || IsKeyPressed(KEY_UP)) menuSelection--;
+			if (IsKeyPressed(KEY_S) || IsKeyPressed(KEY_DOWN)) menuSelection++;
+			if (menuSelection < 0) menuSelection = 2;
+			if (menuSelection > 2) menuSelection = 0;
+			
+			if (IsKeyPressed(KEY_ENTER)) {
+				if (menuSelection == 0) { // Создать сервер
+					InitNetwork();
+					StartServer((rand() % 99) + 1);
 					currentState = STATE_TRANSITION;
 					fadeToWhite = true;
 					transitionAlpha = 0.0f;
-				} else if (menuSelection == 1) {
-					break; 
+							} else if (menuSelection == 1) { // Найти серверы в LAN
+								InitNetwork();
+								DiscoverServers();
+								menuSelection = 0;
+								typingIP = false;
+								currentState = STATE_SERVER_LIST;
+							} else if (menuSelection == 2) { // Назад
+					menuSelection = 0;
+					currentState = STATE_MENU;
 				}
 			}
-		} 
+		}
+
+				else if (currentState == STATE_SERVER_LIST) {
+					UpdateNetwork();
+					
+					if (IsKeyPressed(KEY_I)) {
+						typingIP = !typingIP;
+					}
+					
+					if (typingIP) {
+						int key = GetCharPressed();
+						while (key > 0) {
+							int len = (int)strlen(manualIP);
+							if (((key >= '0' && key <= '9') || key == '.') && len < 15) {
+								manualIP[len] = (char)key;
+								manualIP[len + 1] = '\0';
+							}
+							key = GetCharPressed();
+						}
+						if (IsKeyPressed(KEY_BACKSPACE)) {
+							int len = (int)strlen(manualIP);
+							if (len > 0) manualIP[len - 1] = '\0';
+						}
+						if (IsKeyPressed(KEY_ENTER) && strlen(manualIP) >= 7) {
+							typingIP = false;
+							ConnectToServer(manualIP, 1);
+							currentState = STATE_TRANSITION;
+							fadeToWhite = true;
+							transitionAlpha = 0.0f;
+						}
+					} else {
+						// Автоматически повторяем поиск каждую 1 секунду
+						static float scanTimer = 0.0f;
+						scanTimer += dt;
+						if (scanTimer >= 1.0f) {
+							scanTimer = 0.0f;
+							SendDiscoveryBroadcast();
+						}
+						
+						if (IsKeyPressed(KEY_R)) DiscoverServers();
+						if (IsKeyPressed(KEY_BACKSPACE)) {
+							menuSelection = 0;
+							currentState = STATE_LOBBY;
+						}
+						if (discoveredServersCount > 0) {
+							if (IsKeyPressed(KEY_W) || IsKeyPressed(KEY_UP)) menuSelection--;
+							if (IsKeyPressed(KEY_S) || IsKeyPressed(KEY_DOWN)) menuSelection++;
+							if (menuSelection < 0) menuSelection = discoveredServersCount - 1;
+							if (menuSelection >= discoveredServersCount) menuSelection = 0;
+							
+							if (IsKeyPressed(KEY_ENTER)) {
+								ConnectToServer(discoveredServersIPs[menuSelection], discoveredServerNums[menuSelection]);
+								currentState = STATE_TRANSITION;
+								fadeToWhite = true;
+								transitionAlpha = 0.0f;
+							}
+						}
+					}
+				}
+		
 		else if (currentState == STATE_TRANSITION) {
+			UpdateNetwork();
 			if (fadeToWhite) {
-				transitionAlpha += dt * 1.0f; // Плавное затухание в белый (1 секунда)
+				transitionAlpha += dt * 1.0f;
 				if (transitionAlpha >= 1.0f) {
 					transitionAlpha = 1.0f;
 					fadeToWhite = false;
-					DisableCursor(); 
+					DisableCursor();
 				}
 			} else {
-				transitionAlpha -= dt * 0.6f; // Медленное проявление (около 1.6 секунды)
+				transitionAlpha -= dt * 0.6f;
 				if (transitionAlpha <= 0.0f) {
 					transitionAlpha = 0.0f;
 					currentState = STATE_PLAYING;
 				}
 			}
 		}
-		
 		else if (currentState == STATE_PLAYING) {
-			// Если нажали ESC — мгновенно выходим в главное меню
-			if (IsKeyPressed(KEY_ESCAPE)) {
-				currentState = STATE_MENU;
-				EnableCursor();
-				GenMap(); // Сбрасываем карту и игрока
+			UpdateNetwork();
+			
+			// Если клиент еще не получил ID от сервера — повторяем запрос входа раз в 0.5 сек
+			if (isClient && myPlayerID < 0) {
+				static float joinRetryTimer = 0.0f;
+				joinRetryTimer += dt;
+				if (joinRetryTimer >= 0.5f) {
+					joinRetryTimer = 0.0f;
+					NetworkPacket pkt;
+					memset(&pkt, 0, sizeof(pkt));
+					pkt.type = PKT_JOIN;
+					sendto(udpSocket, (const char*)&pkt, sizeof(pkt), 0, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
+				}
 			}
 			
-		UpdatePlayer(dt); 
+			if (IsKeyPressed(KEY_TAB)) {
+				showTabMenu = !showTabMenu;
+				if (showTabMenu) EnableCursor();
+				else DisableCursor();
+			}
+			
+			if (myPlayerID >= 0 && myPlayerID < MAX_NET_PLAYERS) {
+				if (netPlayers[myPlayerID].isDead) {
+					respawnTimer -= dt;
+					if (respawnTimer <= 0.0f) RespawnMe();
+				} else if (!showTabMenu) {
+					UpdatePlayer(dt);
+				}
+				
+				netPlayers[myPlayerID].x = player.x;
+				netPlayers[myPlayerID].y = player.y;
+				netPlayers[myPlayerID].z = player.z;
+				netPlayers[myPlayerID].pa = player.pa;
+				SendMyState(netPlayers[myPlayerID]);
+			} else if (!showTabMenu) {
+				UpdatePlayer(dt);
+			}
 			
 			if (volume_ui_timer > 0.0f) volume_ui_timer -= dt;
 			if (stamina_ui_timer > 0.0f) stamina_ui_timer -= dt;
 			if (IsKeyDown(KEY_LEFT_BRACKET)) { music_volume -= 0.5f * dt; if (music_volume < 0.0f) music_volume = 0.0f; volume_ui_timer = 2.0f; }
 			if (IsKeyDown(KEY_RIGHT_BRACKET)) { music_volume += 0.5f * dt; if (music_volume > 1.0f) music_volume = 1.0f; volume_ui_timer = 2.0f; }
 			if (hasMusic) SetMusicVolume(music, music_volume);
-		}
+		}	
 		
 		// ============================================================
 		// 2. РЕНДЕР 3D МИРА
@@ -2464,41 +3037,106 @@ int main(void) {
 			EndTextureMode();
 		}
 		
-		// ============================================================
+// ============================================================
 		// 3. ВЫВОД НА ЭКРАН
 		// ============================================================
 		BeginDrawing();
 		ClearBackground(BLACK);
 		
-		// Если мы в меню ИЛИ в первой фазе перехода (затухание в белый) — рисуем МЕНЮ
+		// 1. Главное меню
 		if (currentState == STATE_MENU || (currentState == STATE_TRANSITION && fadeToWhite)) {
 			DrawMainMenu();
 		} 
-		// Иначе (игра, пауза, или вторая фаза перехода) — рисуем ИГРУ
+		// 2. Экран выбора: Создать или Найти сервер
+		else if (currentState == STATE_LOBBY) {
+			int curW = GetScreenWidth();
+			int curH = GetScreenHeight();
+			ClearBackground((Color){15, 15, 15, 255});
+			
+			const char* title = "MULTIPLAYER (LAN)";
+			DrawText(title, curW / 2 - MeasureText(title, 44) / 2, curH / 3 - 20, 44, (Color){220, 200, 150, 255});
+			
+			const char* opts[3] = { "CREATE SERVER", "JOIN LAN SERVER", "BACK" };
+			Color activeCol = (Color){255, 230, 150, 255};
+			Color idleCol   = (Color){80, 75, 60, 255};
+			
+			for (int i = 0; i < 3; i++) {
+				int w = MeasureText(opts[i], 36);
+				int y = curH / 2 + i * 60;
+				Color col = (menuSelection == i) ? activeCol : idleCol;
+				DrawText(opts[i], curW / 2 - w / 2, y, 36, col);
+				if (menuSelection == i) DrawText(">", curW / 2 - w / 2 - 35, y, 36, col);
+			}
+			
+			const char* hint = "W / S - NAVIGATE   |   ENTER - SELECT";
+			DrawText(hint, curW / 2 - MeasureText(hint, 15) / 2, curH - 50, 15, (Color){60, 60, 60, 255});
+		}
+		
+			// 3. Список найденных серверов в локальной сети
+		else if (currentState == STATE_SERVER_LIST) {
+			int curW = GetScreenWidth();
+			int curH = GetScreenHeight();
+			ClearBackground((Color){15, 15, 15, 255});
+			
+			const char* title = "AVAILABLE SERVERS";
+			DrawText(title, curW / 2 - MeasureText(title, 40) / 2, 80, 40, (Color){220, 200, 150, 255});
+			
+			const char* sub = "R - REFRESH   |   BACKSPACE - BACK";
+			DrawText(sub, curW / 2 - MeasureText(sub, 18) / 2, 135, 18, (Color){150, 140, 110, 255});
+			
+			if (discoveredServersCount == 0) {
+				const char* waitTxt = "Searching for servers...";
+				DrawText(waitTxt, curW / 2 - MeasureText(waitTxt, 26) / 2, curH / 2, 26, GRAY);
+			} else {
+				Color activeCol = (Color){255, 230, 150, 255};
+				Color idleCol   = (Color){100, 95, 80, 255};
+				for (int i = 0; i < discoveredServersCount; i++) {
+					const char* label = TextFormat("SERVER #%d   [%s]", discoveredServerNums[i], discoveredServersIPs[i]);
+					int w = MeasureText(label, 30);
+					int y = 210 + i * 50;
+					Color col = (menuSelection == i) ? activeCol : idleCol;
+					DrawText(label, curW / 2 - w / 2, y, 30, col);
+					if (menuSelection == i) DrawText(">", curW / 2 - w / 2 - 35, y, 30, col);
+				}
+			}
+			
+			// Подсказка и поле ручного ввода IP внизу экрана
+			const char* ipPrompt = typingIP 
+			? TextFormat("ENTER HOST IP: %s_  (ENTER TO CONNECT)", manualIP)
+			: "PRESS [I] TO ENTER HOST IP MANUALLY";
+			DrawText(ipPrompt, curW / 2 - MeasureText(ipPrompt, 20) / 2, curH - 80, 20, YELLOW);
+		}
+		
+		// 4. Игра и проявление экрана
 		else {
+			int curW = GetScreenWidth();
+			int curH = GetScreenHeight();
+			
 			float nowTime = (float)GetTime();
 			SetShaderValue(ps2Shader, locTime, &nowTime, SHADER_UNIFORM_FLOAT);
 			
 			BeginShaderMode(ps2Shader);
-			DrawTextureRec(postRT.texture, (Rectangle){0, 0, (float)SW, (float)-SH}, (Vector2){0, 0}, WHITE);
+			DrawTexturePro(
+						   postRT.texture,
+						   (Rectangle){0, 0, (float)SW, (float)-SH},
+						   (Rectangle){0, 0, (float)curW, (float)curH},
+						   (Vector2){0, 0},
+						   0.0f,
+						   WHITE
+						   );
 			EndShaderMode();
 			
 			// HUD
 			if (currentState == STATE_PLAYING) {
-				
-				if (showMap) {
-					DrawTextureRec(minimapRT.texture, (Rectangle){0, 0, 200, -200}, (Vector2){SW - 220, 20}, WHITE);
-				}
-				
 				if (volume_ui_timer > 0.0f) {
-					DrawRectangle(20, SH - 40, 200, 20, Fade(BLACK, 0.5f));
-					DrawRectangle(25, SH - 35, (int)(190 * music_volume), 10, BLUE);
-					DrawText(TextFormat("Vol: %d%% ([ / ])", (int)(music_volume * 100)), 25, SH - 55, 12, WHITE);
+					DrawRectangle(20, curH - 40, 200, 20, Fade(BLACK, 0.5f));
+					DrawRectangle(25, curH - 35, (int)(190 * music_volume), 10, BLUE);
+					DrawText(TextFormat("Vol: %d%% ([ / ])", (int)(music_volume * 100)), 25, curH - 55, 12, WHITE);
 				}
 				
 				// --- ПАТРОНЫ ---
-				int magX = SW - 50;
-				int magBottomY = SH - 40;
+				int magX = curW - 50;
+				int magBottomY = curH - 40;
 				int magHeight = 140;
 				int magWidth = 28;
 				float magYOffset = 0.0f;
@@ -2522,7 +3160,7 @@ int main(void) {
 				int actualMagY = magBottomY + (int)magYOffset;
 				DrawText("AMMO", magX, magBottomY - magHeight - 18, 10, (Color){150, 130, 90, 200});
 				
-				if (actualMagY < SH + magHeight) {
+				if (actualMagY < curH + magHeight) {
 					DrawRectangle(magX, actualMagY - magHeight, magWidth, magHeight, (Color){10, 10, 10, 200});
 					DrawRectangleLines(magX, actualMagY - magHeight, magWidth, magHeight, (Color){100, 85, 60, 220});
 					float bulletH = (float)magHeight / pistol.maxAmmo;
@@ -2567,7 +3205,7 @@ int main(void) {
 					DrawCircle(indX, indY, indR, bg);
 					DrawCircleLines(indX, indY, indR, border);
 					int fillAngle = (int)(360.0f * rp);
-					if (fillAngle > 0) DrawCircleSector((Vector2){indX, indY}, indR - 3, -90.0f, -90.0f + fillAngle, 32, fill);
+					if (fillAngle > 0) DrawCircleSector((Vector2){(float)indX, (float)indY}, indR - 3, -90.0f, -90.0f + fillAngle, 32, fill);
 					DrawText("RELOAD", indX - 24, indY + indR + 8, 11, label);
 				}
 				
@@ -2582,8 +3220,8 @@ int main(void) {
 				// --- СТАМИНА ---
 				if (stamina_ui_timer > 0.0f) {
 					int stW = 200, stH = 6;
-					int stX = SW / 2 - stW / 2;
-					int stY = SH - 30;
+					int stX = curW / 2 - stW / 2;
+					int stY = curH - 30;
 					DrawRectangle(stX, stY, stW, stH, Fade(BLACK, 0.7f));
 					float staminaPercent = player.stamina / player.maxStamina;
 					int fillW = (int)(stW * staminaPercent);
@@ -2595,20 +3233,53 @@ int main(void) {
 				}
 				
 				// --- ПРИЦЕЛ ---
-				int cx = SW / 2 + (int)player.crosshairX;
-				int cy = SH / 2 + (int)player.crosshairY;
-				Color chColor = (Color){255, 255, 255, 220}; 
-				DrawLine(cx, cy - 3, cx, cy + 3, chColor);
-				int gapX = 12, gapY = 4, len = 4;
-				DrawLine(cx - gapX, cy - gapY, cx - gapX, cy + gapY, chColor);
-				DrawLine(cx - gapX, cy - gapY, cx - gapX - len, cy - gapY, chColor);
-				DrawLine(cx + gapX, cy - gapY, cx + gapX, cy + gapY, chColor);
-				DrawLine(cx + gapX, cy - gapY, cx + gapX + len, cy - gapY, chColor);
+				if (!showTabMenu) {
+					float scaleX = (float)curW / (float)SW;
+					float scaleY = (float)curH / (float)SH;
+					int cx = curW / 2 + (int)(player.crosshairX * scaleX);
+					int cy = curH / 2 + (int)(player.crosshairY * scaleY);
+					
+					Color chColor = (Color){255, 255, 255, 220}; 
+					DrawLine(cx, cy - 3, cx, cy + 3, chColor);
+					int gapX = 12, gapY = 4, len = 4;
+					DrawLine(cx - gapX, cy - gapY, cx - gapX, cy + gapY, chColor);
+					DrawLine(cx - gapX, cy - gapY, cx - gapX - len, cy - gapY, chColor);
+					DrawLine(cx + gapX, cy - gapY, cx + gapX, cy + gapY, chColor);
+					DrawLine(cx + gapX, cy - gapY, cx + gapX + len, cy - gapY, chColor);
+				}
+				
+				// --- ОВЕРЛЕЙ НА TAB (НОМЕР СЕРВЕРА И КНОПКА ВЫХОДА) ---
+				if (showTabMenu) {
+					int boxW = 360, boxH = 220;
+					int bx = curW / 2 - boxW / 2;
+					int by = curH / 2 - boxH / 2;
+					
+					DrawRectangle(bx, by, boxW, boxH, Fade(BLACK, 0.85f));
+					DrawRectangleLines(bx, by, boxW, boxH, (Color){150, 130, 90, 255});
+					
+					const char* srvTitle = TextFormat("SERVER #%d", currentServerNumber);
+					DrawText(srvTitle, curW / 2 - MeasureText(srvTitle, 32) / 2, by + 25, 32, (Color){255, 230, 150, 255});
+					
+					if (isServer) {
+						const char* ipTitle = TextFormat("HOST IP: %s", myLocalIP);
+						DrawText(ipTitle, curW / 2 - MeasureText(ipTitle, 20) / 2, by + 68, 20, LIGHTGRAY);
+					}
+					
+					Rectangle btnExit = { (float)(curW / 2 - 110), (float)(by + 120), 220, 50 };
+					bool hover = CheckCollisionPointRec(GetMousePosition(), btnExit);
+					DrawRectangleRec(btnExit, hover ? (Color){140, 45, 35, 255} : (Color){60, 25, 20, 255});
+					DrawRectangleLinesEx(btnExit, 2, (Color){200, 170, 120, 255});
+					DrawText("EXIT GAME", (int)btnExit.x + 48, (int)btnExit.y + 15, 20, RAYWHITE);
+					
+					if ((hover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) || IsKeyPressed(KEY_ENTER)) {
+						break;
+					}
+				}
 			}
 			
 			// БЕЛАЯ ВСПЫШКА
 			if (currentState == STATE_TRANSITION) {
-				DrawRectangle(0, 0, SW, SH, Fade(WHITE, transitionAlpha));
+				DrawRectangle(0, 0, curW, curH, Fade(WHITE, transitionAlpha));
 			}
 		}
 		
@@ -2629,6 +3300,10 @@ int main(void) {
 	if (sndFootstep.frameCount > 0) UnloadSound(sndFootstep);
 	if (sndStaminaOut.frameCount > 0) UnloadSound(sndStaminaOut);
 	if (sndStaminaBack.frameCount > 0) UnloadSound(sndStaminaBack);
+	if (sndHit.frameCount > 0) UnloadSound(sndHit);
+	if (sndDeath.frameCount > 0) UnloadSound(sndHit);
+	if (udpSocket != INVALID_SOCKET) closesocket(udpSocket);
+	WSACleanup();
 	
 	UnloadShader(ps2Shader);
 	UnloadRenderTexture(postRT);
