@@ -53,7 +53,7 @@ int cpu_threads = 4;
 // Игрок
 #define PLAYER_RADIUS 0.4f
 #define EYE_HEIGHT    0.55f
-#define PLAYER_HEIGHT 1.0f
+#define PLAYER_HEIGHT 1.30f // taller remote player models
 
 // Физика
 #define GRAVITY       -12.0f
@@ -104,7 +104,9 @@ typedef struct {
 	float vx, vy, vz;
 	float life;
 	bool active;
-	bool isMagazine; // grey rectangle on reload instead of brass shell
+	bool isMagazine;
+    float rotation;
+    float spinSpeed;
 } Shell;
 
 Shell shells[MAX_SHELLS];
@@ -246,6 +248,29 @@ bool typingIP = false;
 char discoveredServersIPs[10][32];
 int discoveredServerNums[10];
 bool showTabMenu = false;
+bool showPauseMenu = false;
+bool showSettingsMenu = false;
+// CS-style input scaling; this adjusts in-game aiming, not physical mouse hardware DPI.
+float mouseSensitivity = 1.0f;
+int virtualMouseDPI = 800;
+static bool blockFireUntilRelease = false;
+
+static void SaveControls(void) {
+    FILE *f=fopen("controls.cfg","w");
+    if(f) {fprintf(f,"sensitivity=%.3f\ndpi=%d\n",mouseSensitivity,virtualMouseDPI);fclose(f);}
+}
+static void LoadControls(void) {
+    FILE *f=fopen("controls.cfg","r");
+    if(!f)return;
+    char line[100];
+    while(fgets(line,sizeof(line),f)) {
+        float v;int dpi;
+        if(sscanf(line,"sensitivity=%f",&v)==1 && isfinite(v) && v>=0.1f && v<=5.0f)mouseSensitivity=v;
+        if(sscanf(line,"dpi=%d",&dpi)==1 && dpi>=400 && dpi<=3200)virtualMouseDPI=dpi;
+    }
+    fclose(f);
+}
+
 bool showKeyHints = true;
 bool showChatInput = false;
 char chatInput[128] = "";
@@ -340,6 +365,10 @@ static void OnMyDeath(void) {
     pistol.isReloading = false;
     pistol.reloadTimer = 0.0f;
     pistol.animTimer = 0.0f;
+    blockFireUntilRelease = true;
+    showTabMenu=false;
+    showPauseMenu=false;
+    showSettingsMenu=false;
     if (sndDeath.frameCount > 0) PlaySound(sndDeath);
     EnableCursor();
 }
@@ -358,9 +387,15 @@ void RespawnMe(void) {
     pistol.ammo = pistol.maxAmmo;
     pistol.isReloading = false;
     pistol.reloadTimer = 0.0f;
+    pistol.currentFrame = 0;
+    pistol.animTimer = 0.0f;
+    pistol.recoil = 0.0f;
     deathFlash = 0.0f;
     deathAnimPending[myPlayerID >= 0 && myPlayerID < MAX_NET_PLAYERS ? myPlayerID : 0] = false;
-    if (!showTabMenu && !showChatInput) DisableCursor();
+    // A respawn button was clicked: do not fire until the button is released.
+    blockFireUntilRelease = true;
+    pistol.lastShotTime = (float)GetTime();
+    if (!showTabMenu && !showChatInput && !showPauseMenu && !showSettingsMenu) DisableCursor();
 	
 	if (myPlayerID >= 0 && myPlayerID < MAX_NET_PLAYERS) {
 		netPlayers[myPlayerID].x = player.x;
@@ -414,7 +449,7 @@ void StartServer(int serverNumber) {
 	
 	ClearPlayers();
 	netPlayers[0].id = 0;
-	netPlayers[0].faceID = rand() % 8;
+	netPlayers[0].faceID = 0;
 	netActive[0] = true;
 	lastHeard[0] = (float)GetTime();
 	connectedClients = 1;
@@ -575,6 +610,8 @@ static void LeaveServer(void) {
     myPlayerID = -1;
     ClearPlayers();
     showTabMenu = false;
+    showPauseMenu = false;
+    showSettingsMenu = false;
     showChatInput = false;
     EnableCursor();
 }
@@ -636,7 +673,7 @@ void UpdateNetwork(void) {
 						netPlayers[i].id = i;
 						netPlayers[i].health = 100;
 						netPlayers[i].isDead = false;
-                        netPlayers[i].faceID = rand() % 8;
+                        netPlayers[i].faceID = i;
                         netActive[i] = true;
                         lastHeard[i] = (float)GetTime();
                         char joined[96]; snprintf(joined, sizeof(joined), "Player %d joined", i+1);
@@ -661,7 +698,7 @@ void UpdateNetwork(void) {
 			if (myPlayerID >= 0 && myPlayerID < MAX_NET_PLAYERS) {
 				netPlayers[myPlayerID].id = myPlayerID;
 				netPlayers[myPlayerID].health = 100;
-				netPlayers[myPlayerID].faceID = rand() % 8;
+				netPlayers[myPlayerID].faceID = myPlayerID;
                 netActive[myPlayerID] = true;
                 lastHeard[myPlayerID] = (float)GetTime();
                 RespawnMe(); // spawn point matches newly assigned player slot
@@ -744,7 +781,7 @@ void UpdateNetwork(void) {
                     deathAnimPending[id] = true;
                 }
                 netPlayers[id] = pkt.playerData;
-                netPlayers[id].faceID = (unsigned int)netPlayers[id].faceID % 8;
+                netPlayers[id].faceID = id; // each occupied slot has one unique expression
                 netActive[id] = true;
                 lastHeard[id] = (float)GetTime();
 				if (isServer) {
@@ -788,7 +825,7 @@ void UpdateNetwork(void) {
 // Буферы для двухпроходного рендера (ВЫРАВНЕНЫ ПО 64 БАЙТАМ ДЛЯ OPENMP)
 float fov     = 60.0f * (PI / 180.0f);
 float depth   = 64.0f;
-bool showMap  = true;
+
 
 __attribute__((aligned(64))) int rawStartBuf[SW], rawEndBuf[SW];
 __attribute__((aligned(64))) int   drawStartBuf[SW];
@@ -806,6 +843,7 @@ __attribute__((aligned(64))) int   shadeFloorBuf[SH];
 float zbuf[SW];
 float moonLightBuf[SW];
 int wallMapXBuf[SW],wallMapYBuf[SW];
+unsigned char posterFlipBuf[SW];
 
 int   drawEndBuf[SW];
 int   texIDBuf[SW];
@@ -886,24 +924,49 @@ static inline Color MixColor(Color a, Color b, float t) {
 #define TOFU_SIZE 64
 Color tofuData[8][TOFU_SIZE][TOFU_SIZE]; // Массив для пиксельного рендера
 
+// Eight deliberate, recognizably different expressions; index == player slot.
+// No random face reassignments when a player sends position packets.
 void GenerateTofuTextures(void) {
-    // Entire image is a face decal; no opaque square frame around it.
-    for (int f=0; f<8; ++f) for (int y=0; y<TOFU_SIZE; ++y) for (int x=0; x<TOFU_SIZE; ++x) {
-        float nx = (x-31.5f)/31.5f, ny = (y-31.5f)/31.5f;
-        unsigned char grain = (unsigned char)(hash2(x+f*17, y) % 12);
-        Color c = { (unsigned char)(224-grain), (unsigned char)(217-grain), (unsigned char)(199-grain), 255 };
-        // Black eyebrows, eyes and varied expressions.
-        bool leftEye = (abs(x-20)<4 && abs(y-25)<5);
-        bool rightEye = (abs(x-44)<4 && abs(y-25)<5);
-        if (leftEye || rightEye) c = (Color){16,17,19,255};
-        if (abs(y-17)<2 && ((x>=15 && x<=26) || (x>=39 && x<=50))) c = (Color){45,38,32,255};
-        float mouthY = 43.0f;
-        if (f%4 == 0) mouthY += fabsf(x-32)*0.28f;
-        if (f%4 == 1) mouthY -= fabsf(x-32)*0.25f;
-        if (f%4 == 2 && abs(x-32)<9 && y>40 && y<49) c = (Color){35,26,30,255};
-        if (f%4 != 2 && x>20 && x<44 && fabsf(y-mouthY)<2.1f) c = (Color){35,26,30,255};
-        if (f>=4 && x>=10 && x<=28 && y>=23 && y<=31) c = (Color){85,105,116,255};
-        if (nx*nx+ny*ny > 1.05f) c.a=0;
+    const Color skins[8]={
+        {236,216,190,255},{218,198,171,255},{233,213,185,255},{215,204,183,255},
+        {239,215,182,255},{222,207,191,255},{229,201,159,255},{186,209,217,255}
+    };
+    for(int f=0;f<8;++f)for(int y=0;y<TOFU_SIZE;++y)for(int x=0;x<TOFU_SIZE;++x) {
+        float xx=(x-31.5f)/29.0f, yy=(y-32.0f)/30.0f;
+        float oval=xx*xx+yy*yy;
+        Color c=skins[f];
+        c.a=(oval<=1.0f)?255:0;
+        if(!c.a){tofuData[f][y][x]=c;continue;}
+        int shade=(int)((hash2(x+f*53,y+13)&7u));
+        c.r-=shade;c.g-=shade;c.b-=shade;
+        if(oval>0.86f)c=(Color){120,107,96,255}; // soft outline
+        bool eyeL=(abs(x-21)<4 && abs(y-25)<4);
+        bool eyeR=(abs(x-43)<4 && abs(y-25)<4);
+        bool browL=(x>=15 && x<=26 && abs(y-(f==1?18+(x-15)/5:17))<2);
+        bool browR=(x>=37 && x<=49 && abs(y-(f==1?21-(x-37)/5:17))<2);
+        if(f==3) {eyeL=(x>=17&&x<=25&&y==26);eyeR=(x>=39&&x<=47&&y==26);}
+        if(f==5)eyeR=(x>=39&&x<=47&&y==26); // wink
+        if(f==7) {eyeL=(abs(x-21)<5&&abs(y-25)<5);eyeR=(abs(x-43)<5&&abs(y-25)<5);}
+        if(eyeL||eyeR||browL||browR)c=(Color){26,27,29,255};
+        // Contrasting eyes help the slot designs read even at a distance.
+        if(f==7 && (eyeL||eyeR))c=(Color){75,224,238,255};
+        if(f==4 && ((((abs(x-21)==8||abs(x-43)==8)&&y>18&&y<34) || (y==18&&x>12&&x<52))))
+            c=(Color){29,31,31,255}; // glasses
+        if(f==6 && ((x>=27&&x<=37&&y==35)||(abs(x-31)<2&&y==34)))c=(Color){160,91,78,255};
+        // The mouth styles use unique, easily distinguishable silhouettes.
+        if(f==0 && x>=19 && x<=45 && abs(y-(41+(int)(5.0f*(1.0f-fabsf((float)(x-32))/13.0f))))<=1)c=(Color){45,30,35,255}; // smile
+        if(f==1 && x>=20 && x<=44 && abs(y-(48-(int)(5.0f*(1.0f-fabsf((float)(x-32))/12.0f))))<=1)c=(Color){40,30,30,255}; // angry frown
+        if(f==2 && abs(x-32)<=7 && abs(y-46)<=9 && ((x-32)*(x-32)/49.0f+(y-46)*(y-46)/81.0f)<1.0f)c=(Color){48,28,35,255}; // surprised
+        if(f==3 && x>=24&&x<=40&&y==45)c=(Color){56,42,40,255}; // sleepy
+        if(f==4 && x>=22&&x<=43&&y>=43&&y<=47)c=(Color){68,37,31,255}; // teeth
+        if(f==4 && x>=22&&x<=43&&y==45)c=WHITE;
+        if(f==5 && x>=23&&x<=42&&abs(y-(41+(x-23)/6))<2)c=(Color){40,36,36,255}; // smirk
+        if(f==6 && x>=20&&x<=44&&abs(y-(45+(int)(4.0f*(1-fabsf((float)(x-32))/12.0f))))<2)c=(Color){41,28,34,255};
+        if(f==6 && x>=31&&x<=36&&y>=48&&y<=55)c=(Color){220,104,115,255}; // tongue
+        if(f==7 && x>=20&&x<=44&&y>=43&&y<=48)c=(Color){48,66,72,255}; // robotic grille
+        if(f==7 && y==45&&x%6==0&&x>=20&&x<=44)c=(Color){158,221,218,255};
+        if(f==0 && ((abs(x-12)<2&&abs(y-34)<2)||(abs(x-52)<2&&abs(y-34)<2)))c=(Color){194,104,105,255};
+        if(f==3 && x>=15&&x<=49&&y==12)c=(Color){61,59,64,255}; // hair
         tofuData[f][y][x]=c;
     }
 }
@@ -917,14 +980,25 @@ static void LoadPosters(void) {
         if (!FileExists(path)) snprintf(path,sizeof(path),"posters/%d.jpeg",i+1);
         if (!FileExists(path)) continue;
         Image im=LoadImage(path);
-        if (!im.data || im.width<=0 || im.height<=0) continue;
-        // Cropping to a square avoids stretching of photographs.
-        int side=im.width<im.height?im.width:im.height;
-        ImageCrop(&im,(Rectangle){(float)(im.width-side)/2,(float)(im.height-side)/2,(float)side,(float)side});
-        ImageResize(&im,POSTER_RES,POSTER_RES);
-        for (int y=0;y<POSTER_RES;++y)
-            for(int x=0;x<POSTER_RES;++x)
-                posterData[i][y][x]=GetImageColor(im,x,y);
+        if (!im.data || im.width<=0 || im.height<=0) {if(im.data)UnloadImage(im);continue;}
+        // CONTAIN / LETTERBOX: preserve the ENTIRE photo and its aspect ratio.
+        // Landscape images get bars top/bottom; portraits get bars left/right.
+        float scale=fminf((float)(POSTER_RES-4)/im.width,(float)(POSTER_RES-4)/im.height);
+        int iw=(int)floorf(im.width*scale+0.5f),ih=(int)floorf(im.height*scale+0.5f);
+        if(iw<1)iw=1;
+        if(ih<1)ih=1;
+        int ox=(POSTER_RES-iw)/2,oy=(POSTER_RES-ih)/2;
+        for(int y=0;y<POSTER_RES;++y)for(int x=0;x<POSTER_RES;++x){
+            Color c={29,28,26,255}; // thin poster backing
+            if(x>=ox && x<ox+iw && y>=oy && y<oy+ih) {
+                int ix=(int)((x-ox+0.5f)*im.width/iw);
+                int iy=(int)((y-oy+0.5f)*im.height/ih);
+                if(ix>=im.width)ix=im.width-1;
+                if(iy>=im.height)iy=im.height-1;
+                c=GetImageColor(im,ix,iy);
+            }
+            posterData[i][y][x]=c;
+        }
         posterLoaded[i]=true;
         UnloadImage(im);
     }
@@ -1996,6 +2070,7 @@ static void SpawnDroppedMagazine(void) {
         a->vx=cosf(player.pa)*0.45f+rightX*0.7f;
         a->vy=sinf(player.pa)*0.45f+rightY*0.7f;
         a->vz=0.7f; a->life=9.0f;
+        a->rotation=0.15f; a->spinSpeed=5.8f;
         break;
     }
 }
@@ -2067,6 +2142,7 @@ void FireWeapon(void) {
 			shells[i].vz = 2.5f + (rand() % 100 - 50) * 0.02f;
             shells[i].life = 5.0f;
             shells[i].isMagazine = false;
+            shells[i].rotation=0.0f; shells[i].spinSpeed=7.0f;
 			break;
 		}
 	}
@@ -2077,6 +2153,7 @@ void FireWeapon(void) {
 		if (!shells[i].active) continue;
 		
         shells[i].life -= dt;
+        shells[i].rotation += shells[i].spinSpeed*dt;
         if (shells[i].life <= 0) { shells[i].active = false; continue; }
 		
 		float drag = expf(-1.5f * dt);
@@ -2105,6 +2182,7 @@ void FireWeapon(void) {
 					shells[i].vz = 0.0f; 
 					shells[i].vx = 0.0f; 
 					shells[i].vy = 0.0f;
+                    shells[i].spinSpeed *= 0.30f;
 				}
 		
 		int mapX = (int)floorf(nx);
@@ -2132,8 +2210,9 @@ void FireWeapon(void) {
     player.crosshairY=0.0f;
     player.aimSpreadX=0.0f;
     player.aimSpreadY=0.0f;
-    player.pa+=md.x*0.0025f;
-    player.pitch-=md.y*0.0025f;
+    float mouseScale=0.0025f*mouseSensitivity*(virtualMouseDPI/800.0f);
+    player.pa+=md.x*mouseScale;
+    player.pitch-=md.y*mouseScale;
     player.pitch=fmaxf(-MAX_PITCH,fminf(MAX_PITCH,player.pitch));
     if(player.pa<0.0f)player.pa+=2.0f*PI;
     if(player.pa>=2.0f*PI)player.pa-=2.0f*PI;
@@ -2279,9 +2358,12 @@ void FireWeapon(void) {
 		}
 
 	// --- СТРЕЛЬБА ---
-	if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) || IsKeyDown(KEY_LEFT_CONTROL)) {
-		FireWeapon();
-	}
+	if (blockFireUntilRelease) {
+        if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT) && !IsKeyDown(KEY_LEFT_CONTROL))
+            blockFireUntilRelease=false;
+    } else if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) || IsKeyDown(KEY_LEFT_CONTROL)) {
+        FireWeapon();
+    }
 	
 	// --- ПЕРЕЗАРЯДКА ---
 	if (IsKeyPressed(KEY_R) && !pistol.isReloading && pistol.ammo < pistol.maxAmmo) {
@@ -2323,12 +2405,56 @@ void FireWeapon(void) {
 		pistol.currentFrame = 0;
 	}
 	
-	if (IsKeyPressed(KEY_M)) showMap = !showMap;
 }
 
 // ------------------------------------------------------------
 //  СЕКТОР 11: РЕНДЕР (ПОЛНОСТЬЮ ИСПРАВЛЕННЫЙ, МОНОЛИТНЫЙ)
 // ------------------------------------------------------------
+
+// Stylized non-graphic burst: polygon-like fragments fly from the player model.
+static void RenderDeathBurst(Color *pixels, const NetworkPlayer *np,int slot,
+                             float camX,float camY,float camZ,float dirX,float dirY,
+                             float planeLen,float projPlane,float horizon) {
+    float elapsed=(float)GetTime()-deathAnimStart[slot];
+    if(elapsed<0.0f || elapsed>1.45f){deathAnimPending[slot]=false;return;}
+    float life=1.0f-elapsed/1.45f;
+    float spread=0.2f+elapsed*2.1f;
+    for(int k=0;k<34;++k) {
+        unsigned int h=hash2((unsigned int)(slot*47+k*17+3),(unsigned int)(k*71+23));
+        float angle=((h&1023u)/1023.0f)*2.0f*PI;
+        float velocity=0.35f+((h>>10)&255u)/255.0f*0.75f;
+        float ox=cosf(angle)*spread*velocity,oy=sinf(angle)*spread*velocity;
+        float dz=0.33f+((h>>18)&255u)/255.0f*0.9f + elapsed*(0.25f+((k*37)%13)*0.07f)-2.7f*elapsed*elapsed;
+        float wx=np->x+ox,wy=np->y+oy,wz=np->z+dz;
+        float dx=wx-camX,dy=wy-camY;
+        float forward=dx*dirX+dy*dirY;
+        if(forward<0.12f || forward>depth)continue;
+        float side=dx*(-dirY)+dy*dirX;
+        int cx=(int)((side/(forward*planeLen)+1.0f)*SW*0.5f);
+        int cy=(int)(horizon-(wz-camZ)*projPlane/forward);
+        float physical=(k%4==0?0.13f:0.075f)*life;
+        int size=(int)fmaxf(1.0f,fminf(28.0f,physical*projPlane/forward));
+        Color fragment;
+        switch(k%5){
+            case 0:fragment=(Color){224,211,176,255};break;
+            case 1:fragment=(Color){171,172,161,255};break;
+            case 2:fragment=(Color){84,107,116,255};break;
+            case 3:fragment=(Color){235,175,97,255};break;
+            default:fragment=(Color){209,222,220,255};break;
+        }
+        float a=fminf(1.0f,life*1.7f)*(0.75f+0.25f*sinf(k*4.0f));
+        for(int yy=cy-size/2;yy<=cy+size/2;++yy) {
+            if(yy<0||yy>=SH)continue;
+            for(int xx=cx-size/2;xx<=cx+size/2;++xx) {
+                if(xx<0||xx>=SW||forward>=zbuf[xx]-0.02f)continue;
+                // Small facets rather than a flat rectangular explosion.
+                if(abs(xx-cx)+abs(yy-cy)>size)continue;
+                int at=yy*SW+xx;
+                pixels[at]=MixColor(pixels[at],fragment,a);
+            }
+        }
+    }
+}
 
 void RenderFrame(Color *pixels) {
 	float dirX = cosf(player.pa), dirY = sinf(player.pa);
@@ -2393,6 +2519,8 @@ void RenderFrame(Color *pixels) {
         zbuf[x] = perpDist;
         wallMapXBuf[x]=mapX;
         wallMapYBuf[x]=mapY;
+        // U runs left to right as perceived from every visible wall face.
+        posterFlipBuf[x]=(unsigned char)((side==0 && rayDirX<0.0f) || (side==1 && rayDirY>0.0f));
 		
 		float wallFloorZ = Z_FLOOR, wallCeilZ = Z_CEIL; int wallTexID = 0;
 		float lightMultiplier = 1.0f;
@@ -2506,7 +2634,7 @@ void RenderFrame(Color *pixels) {
                 if (wcX>=0 && wcX<MW && wcY>=0 && wcY<MH) {
                     int pi=(int)posterAt[wcX][wcY];
                     if(pi>=0 && pi<MAX_POSTERS && posterLoaded[pi]) {
-                        float u=txBuf[x]/(float)TS;
+                        float u=(posterFlipBuf[x] ? TS-1-txBuf[x] : txBuf[x])/(float)(TS-1);
                         float worldZ=camZ+(horizon-y)*perpBuf[x]/projPlane;
                         float z0=map[wcX][wcY].floorZ+0.9f;
                         if(u>=0.14f && u<0.86f && worldZ>=z0 && worldZ<z0+0.72f) {
@@ -2568,12 +2696,10 @@ void RenderFrame(Color *pixels) {
     for(int i=0;i<MAX_NET_PLAYERS;++i) {
         if(i==myPlayerID || !netActive[i]) continue;
         NetworkPlayer *np=&netPlayers[i];
-        float sink=0.0f;
         if(np->isDead) {
-            if(!deathAnimPending[i]) continue;
-            float elapsed=(float)GetTime()-deathAnimStart[i];
-            if(elapsed>1.2f) {deathAnimPending[i]=false;continue;}
-            sink=fminf(1.0f,elapsed/1.2f)*PLAYER_HEIGHT*1.2f;
+            if(deathAnimPending[i])
+                RenderDeathBurst(pixels,np,i,camX,camY,camZ,dirX,dirY,planeLen,projPlane,horizon);
+            continue; // no underground sinking, model bursts apart
         }
         float dx=np->x-camX,dy=np->y-camY;
         float forward=dx*dirX+dy*dirY;
@@ -2582,7 +2708,8 @@ void RenderFrame(Color *pixels) {
         float cx=(side/(forward*planeLen)+1.0f)*SW*0.5f;
         float width=(PLAYER_RADIUS/forward)*projPlane*2.4f;
         int xl=(int)floorf(cx-width),xr=(int)ceilf(cx+width);
-        if(xl<0)xl=0; if(xr>=SW)xr=SW-1;
+        if(xl<0)xl=0;
+        if(xr>=SW)xr=SW-1;
         for(int sx=xl;sx<=xr;++sx) {
             float cameraColumn=2.0f*sx/(float)SW-1.0f;
             float rx=dirX+planeX*cameraColumn, ry=dirY+planeY*cameraColumn;
@@ -2594,17 +2721,18 @@ void RenderFrame(Color *pixels) {
             if(hit<0.08f || hit>depth || hit>=zbuf[sx]-0.02f)continue;
             float hitx=camX+rx*hit-np->x,hity=camY+ry*hit-np->y;
             float normalX=hitx/PLAYER_RADIUS,normalY=hity/PLAYER_RADIUS;
-            int top=(int)(horizon-((np->z+PLAYER_HEIGHT-sink)-camZ)/hit*projPlane);
-            int bottom=(int)(horizon-((np->z-sink)-camZ)/hit*projPlane);
+            int top=(int)(horizon-((np->z+PLAYER_HEIGHT)-camZ)/hit*projPlane);
+            int bottom=(int)(horizon-((np->z)-camZ)/hit*projPlane);
             if(top>=SH || bottom<0 || top>=bottom)continue;
-            if(top<0)top=0;if(bottom>=SH)bottom=SH-1;
+            if(top<0)top=0;
+            if(bottom>=SH)bottom=SH-1;
             float faceForward=cosf(np->pa)*normalX+sinf(np->pa)*normalY;
             float faceSide=-sinf(np->pa)*normalX+cosf(np->pa)*normalY;
             float shade=fmaxf(0.22f,1.0f-hit/depth*0.80f);
             shade*=0.72f+0.28f*fmaxf(0.0f,normalX*cosf(2.5f)+normalY*sinf(2.5f));
             for(int sy=top;sy<=bottom;++sy) {
                 float worldZ=camZ+(horizon-sy)*hit/projPlane;
-                float v=(np->z+PLAYER_HEIGHT-sink-worldZ)/PLAYER_HEIGHT;
+                float v=(np->z+PLAYER_HEIGHT-worldZ)/PLAYER_HEIGHT;
                 Color c={183,180,163,255};
                 // The face decal only appears in the direction the player looks.
                 if(faceForward>0.70f && fabsf(faceSide)<0.68f && v>0.16f && v<0.82f) {
@@ -2665,23 +2793,17 @@ void RenderFrame(Color *pixels) {
 		
 		float wallDist = zbuf[px];
 		if (projDist > wallDist + 0.3f) continue;
-		if (wallDist >= 100.0f) continue; // Полное исчезновение на 100 метрах
+		if (wallDist >= depth) continue;
 		
-		// Нелинейная кривая размера: (1 - t)^2 от 1м до 100м
-		float t = (wallDist - 1.0f) / 99.0f;
-		if (t < 0.0f) t = 0.0f;
-		float sizeScale = (1.0f - t) * (1.0f - t);
-		
-		// Не даем радиусу обнулиться раньше 100м — держим минимум 1 пиксель,
-		// чтобы на последних метрах дырка плавно растворилась через альфа-канал
-		int radius = (int)roundf(3.0f * sizeScale);
-		if (radius < 1) radius = 1;
-		if (radius > 3) radius = 3;
-		
+        // Physically projected bullet impact: shrinks proportionally to 1/distance.
+        int radius=(int)roundf(0.007f*projPlane/fmaxf(0.15f,wallDist));
+        if(radius<1)radius=1;
+        if(radius>30)radius=30;
+
 		// Плавный Fade Out (прозрачность) на дистанции от 75 до 100 метров (smoothstep)
 		float alpha = 1.0f;
-		if (wallDist > 75.0f) {
-			float ft = (100.0f - wallDist) / 25.0f;
+		if (wallDist > depth*0.78f) {
+            float ft = (depth - wallDist) / (depth*0.22f);
 			if (ft < 0.0f) ft = 0.0f;
 			alpha = ft * ft * (3.0f - 2.0f * ft);
 		}
@@ -2725,7 +2847,7 @@ void RenderFrame(Color *pixels) {
 		float dy = shells[i].y - camY;
 		
 		float projDist = dx * dirX + dy * dirY;
-		if (projDist < 0.1f || projDist >= 100.0f) continue;
+		if (projDist < 0.1f || projDist >= depth) continue;
 		
 		float sideDist = dx * (-dirY) + dy * dirX;
 		float camXc = sideDist / (projDist * planeLen);
@@ -2736,23 +2858,18 @@ void RenderFrame(Color *pixels) {
 		if (px < 0 || px >= SW) continue;
 		if (projDist > zbuf[px] + 0.1f) continue;
 		
-		// Нелинейное уменьшение размера: (1 - t)^2
-		float t = (projDist - 1.0f) / 99.0f;
-		if (t < 0.0f) t = 0.0f;
-		float sizeScale = (1.0f - t) * (1.0f - t);
-		
-		// Минимум 1x1 пиксель до самых 100 метров, чтобы растворялась без скачка
-        int w = (int)roundf((shells[i].isMagazine ? 17.0f : 7.0f) * sizeScale);
-        int h = (int)roundf((shells[i].isMagazine ? 29.0f : 3.0f) * sizeScale);
-		if (w < 1) w = 1;
-        if (w > (shells[i].isMagazine?17:7)) w = shells[i].isMagazine?17:7;
-        if (h < 1) h = 1;
-        if (h > (shells[i].isMagazine?29:3)) h = shells[i].isMagazine?29:3;
-		
+        // True perspective sizes in world units. No constant-size sprites at a distance.
+        float itemW=shells[i].isMagazine?0.085f:0.023f;
+        float itemH=shells[i].isMagazine?0.185f:0.014f;
+        int w=(int)fmaxf(1.0f,roundf(itemW*projPlane/fmaxf(0.12f,projDist)));
+        int h=(int)fmaxf(1.0f,roundf(itemH*projPlane/fmaxf(0.12f,projDist)));
+        if(w>SW)w=SW;
+        if(h>SH)h=SH;
+
 		// Плавный Fade Out от 75 до 100 метров + затухание в конце жизни гильзы (последняя 1.0 секунда)
 		float alpha = 1.0f;
-		if (projDist > 75.0f) {
-			float ft = (100.0f - projDist) / 25.0f;
+		if (projDist > depth*0.78f) {
+            float ft = (depth - projDist) / (depth*0.22f);
 			if (ft < 0.0f) ft = 0.0f;
 			alpha *= ft * ft * (3.0f - 2.0f * ft);
 		}
@@ -2780,7 +2897,36 @@ void RenderFrame(Color *pixels) {
 		
 		int py = (int)((float)horizon - (shells[i].z - camZ) / projDist * projPlane);
 		
-		for (int sx_loop = px - w / 2; sx_loop <= px + w / 2; sx_loop++) {
+        if(shells[i].isMagazine) {
+            // Rotating, bevelled steel magazine: upper feed lips, body seam and grip ridges.
+            float rot=shells[i].rotation;
+            float cs=cosf(rot),sn=sinf(rot);
+            int bound=(int)(sqrtf((float)(w*w+h*h))*0.55f+3.0f);
+            for(int sy=py-bound;sy<=py+bound;++sy) {
+                if(sy<0||sy>=SH)continue;
+                for(int sx=px-bound;sx<=px+bound;++sx) {
+                    if(sx<0||sx>=SW||projDist>=zbuf[sx]-0.05f)continue;
+                    float xx=(sx-px)*cs+(sy-py)*sn;
+                    float yy=-(sx-px)*sn+(sy-py)*cs;
+                    float u=xx/fmaxf(1.0f,w*.5f),v=yy/fmaxf(1.0f,h*.5f);
+                    if(fabsf(u)>1.0f||fabsf(v)>1.0f)continue;
+                    float edge=fabsf(u);
+                    Color steel=(Color){(unsigned char)(118*distShade),
+                                         (unsigned char)(128*distShade),
+                                         (unsigned char)(139*distShade),255};
+                    if(edge>0.85f) steel=(Color){(unsigned char)(48*distShade),(unsigned char)(55*distShade),(unsigned char)(64*distShade),255};
+                    else if(u< -0.35f)steel=(Color){(unsigned char)(156*distShade),(unsigned char)(165*distShade),(unsigned char)(173*distShade),255};
+                    if(v< -0.76f)steel=(Color){(unsigned char)(62*distShade),(unsigned char)(68*distShade),(unsigned char)(75*distShade),255}; // feed lips
+                    else if(v>0.79f)steel=(Color){(unsigned char)(38*distShade),(unsigned char)(44*distShade),(unsigned char)(51*distShade),255}; // base plate
+                    else if(v>0.30f && ((int)((v+1.0f)*32.0f)%5)==0)steel=(Color){(unsigned char)(64*distShade),(unsigned char)(76*distShade),(unsigned char)(88*distShade),255};
+                    if(fabsf(u+0.65f)<0.035f && v>-0.6f && v<0.65f)steel=(Color){(unsigned char)(194*distShade),(unsigned char)(197*distShade),(unsigned char)(200*distShade),255}; // highlight
+                    if(v>0.57f && v<0.72f && fabsf(u)<0.47f)steel=(Color){(unsigned char)(46*distShade),(unsigned char)(53*distShade),(unsigned char)(59*distShade),255}; // base marking
+                    pixels[sy*SW+sx]=MixColor(pixels[sy*SW+sx],steel,alpha);
+                }
+            }
+            continue;
+        }
+        for (int sx_loop = px - w / 2; sx_loop <= px + w / 2; sx_loop++) {
 			if (sx_loop < 0 || sx_loop >= SW) continue;
 			if (projDist > zbuf[sx_loop] + 0.1f) continue;
 			
@@ -2808,107 +2954,10 @@ void RenderFrame(Color *pixels) {
 }
 	
 // ------------------------------------------------------------
-//  СЕКТОР 12: МИНИ-КАРТА И MAIN
+//  СЕКТОР 12: MAIN MENU / SETTINGS
 // ------------------------------------------------------------
 
-void DrawMiniMap(RenderTexture2D minimapRT) {
-	if (!showMap) return;
-	
-	BeginTextureMode(minimapRT);
-	// Делаем фон полностью прозрачным (BLANK), чтобы квадрат миникарты не перекрывал игру
-	ClearBackground(BLANK); 
-	
-	int centerX = 100;
-	int centerY = 100;
-	int radius = 80; // Радиус нашего радара
-	int mmSize = 5;
-	int curCellX = (int)player.x;
-	int curCellY = (int)player.y;
-	
-	// 1. РИСУЕМ КАРТУ (Только внутри круга)
-	for (int mx = -20; mx <= 20; mx++) {
-		for (int my = -20; my <= 20; my++) {
-			int cx = curCellX + mx;
-			int cy = curCellY + my;
-			if (cx < 0 || cx >= MW || cy < 0 || cy >= MH) continue;
-			
-			Cell *c = &map[cx][cy];
-			if (c->type == CELL_EMPTY) continue; 
-			
-			// Вычисляем расстояние от центра, чтобы обрезать карту по кругу
-			float dx = mx * mmSize;
-			float dy = my * mmSize;
-			if (dx * dx + dy * dy > radius * radius) continue; // Если за пределами круга — пропускаем
-			
-			// Темно-коричневые стены, чуть светлее ящики
-			Color col = (Color){35, 30, 25, 255};
-			if (c->type == CELL_CRATE) col = (Color){60, 45, 30, 255};
-			
-			DrawRectangle(centerX + (int)dx - (mmSize/2), centerY + (int)dy - (mmSize/2), mmSize, mmSize, col);
-		}
-	}
-	
-	// 2. ЗАТЕНЕНИЕ ПО КРАЯМ (Эффект линзы/радара)
-	// Рисуем темные полупрозрачные круги поверх краев карты, чтобы она растворялась в темноте
-	DrawRing((Vector2){centerX, centerY}, radius - 15, radius, 0, 360, 36, Fade(BLACK, 0.6f));
-	DrawRing((Vector2){centerX, centerY}, radius - 5, radius, 0, 360, 36, Fade(BLACK, 0.8f));
-	
-	// 3. МЕТАЛЛИЧЕСКОЕ КОЛЬЦО (Внешний корпус)
-	Color ringColor = (Color){80, 70, 50, 255}; // Грязно-латунный цвет
-	// Внешний обод
-	DrawRing((Vector2){centerX, centerY}, radius, radius + 6, 0, 360, 36, ringColor);
-	// Внутренняя тонкая линия
-	DrawRing((Vector2){centerX, centerY}, radius - 1, radius, 0, 360, 36, (Color){20, 20, 15, 255});
-	
-	// 4. НАСЕЧКИ (Как на компасе)
-	for (int i = 0; i < 360; i += 15) {
-		float angle = i * DEG2RAD;
-		float x1 = centerX + cosf(angle) * (radius + 2);
-		float y1 = centerY + sinf(angle) * (radius + 2);
-		float x2 = centerX + cosf(angle) * (radius + 6);
-		float y2 = centerY + sinf(angle) * (radius + 6);
-		
-		// Каждая 4-я насечка (каждые 60 градусов) — длиннее и ярче
-		if (i % 60 == 0) {
-			x1 = centerX + cosf(angle) * radius;
-			DrawLine((int)x1, (int)y1, (int)x2, (int)y2, (Color){180, 160, 120, 255});
-		} else {
-			DrawLine((int)x1, (int)y1, (int)x2, (int)y2, (Color){100, 90, 70, 200});
-		}
-	}
-	
-	// 5. ПОТЁРТОСТИ И ЦАРАПИНЫ
-	// Рисуем несколько случайных линий поверх кольца (используем фиксированные координаты, чтобы не мерцало)
-	Color scratchColor = (Color){30, 25, 15, 150};
-	DrawLine(centerX - 70, centerY - 45, centerX - 80, centerY - 55, scratchColor); // Царапина сверху-слева
-	DrawLine(centerX + 60, centerY + 60, centerX + 75, centerY + 50, scratchColor);  // Царапина снизу-справа
-	DrawLine(centerX + 82, centerY - 10, centerX + 85, centerY - 20, scratchColor);  // Справа
-	DrawCircle(centerX - 40, centerY + 75, 2, (Color){20, 20, 10, 200}); // Пятно/скол
-	DrawCircle(centerX + 45, centerY - 65, 1.5f, (Color){20, 20, 10, 200}); // Ещё скол
-	
-	// 6. МАРКЕР ИГРОКА (В центре)
-	// Бледно-желтая точка
-	DrawCircle(centerX, centerY, 3, (Color){220, 200, 150, 255});
-	
-	// Указатель направления взгляда (в виде треугольника/стрелки)
-	float viewLength = 15.0f;
-	float coneWidth = 4.0f;
-	float lookX = centerX + cosf(player.pa) * viewLength;
-	float lookY = centerY + sinf(player.pa) * viewLength;
-	
-	// Линия направления
-	DrawLine(centerX, centerY, (int)lookX, (int)lookY, (Color){220, 200, 150, 255});
-	
-	// Верхушка стрелки (чтобы было видно, куда именно смотрит игрок)
-	float perpAngle = player.pa + PI/2;
-	int tipX1 = (int)(lookX + cosf(perpAngle) * coneWidth);
-	int tipY1 = (int)(lookY + sinf(perpAngle) * coneWidth);
-	int tipX2 = (int)(lookX - cosf(perpAngle) * coneWidth);
-	int tipY2 = (int)(lookY - sinf(perpAngle) * coneWidth);
-	DrawTriangle((Vector2){(float)lookX, (float)lookY}, (Vector2){(float)tipX1, (float)tipY1}, (Vector2){(float)tipX2, (float)tipY2}, (Color){220, 200, 150, 255});
-	
-	EndTextureMode();
-}
+// Minimap intentionally removed: navigation is entirely first-person.
 
 	bool isFullscreen = false;
 	void ToggleScreenMode(void) {
@@ -2930,85 +2979,148 @@ void DrawMiniMap(RenderTexture2D minimapRT) {
 		}
 	}
 	
-	void DrawMainMenu(void) {
-		int curW = GetScreenWidth();
-		int curH = GetScreenHeight();
-		
-		ClearBackground((Color){15, 15, 15, 255});
-		
-		// Заголовок
-		const char* title = "BATTLE SIMULATION";
-		int titleSize = 60;
-		int titleWidth = MeasureText(title, titleSize);
-		int titleX = curW / 2 - titleWidth / 2;
-		int titleY = curH / 3 - 30;
-		
-		DrawText(title, titleX + 3, titleY + 3, titleSize, (Color){50, 45, 30, 255});
-		DrawText(title, titleX, titleY, titleSize, (Color){220, 200, 150, 255});
-		
-		const char* subtitle = "in hard times";
-		int subWidth = MeasureText(subtitle, 20);
-		DrawText(subtitle, curW / 2 - subWidth / 2, titleY + 70, 20, (Color){150, 140, 110, 255});
-		
-		// Кнопки
-		const char* playText   = "START";
-		const char* screenText = isFullscreen ? "DISPLAY: FULLSCREEN" : "DISPLAY: WINDOWED";
-		const char* exitText   = "EXIT";
-		
-		int playWidth   = MeasureText(playText, 36);
-		int screenWidth = MeasureText(screenText, 36);
-		int exitWidth   = MeasureText(exitText, 36);
-		
-		int playY   = curH / 2 + 20;
-		int screenY = curH / 2 + 80;
-		int exitY   = curH / 2 + 140;
-		
-		Color activeCol = (Color){255, 230, 150, 255};
-		Color idleCol   = (Color){80, 75, 60, 255};
-		
-		// 0: PLAY
-		Color playColor = (menuSelection == 0) ? activeCol : idleCol;
-		DrawText(playText, curW / 2 - playWidth / 2, playY, 36, playColor);
-		if (menuSelection == 0) DrawText(">", curW / 2 - playWidth / 2 - 35, playY, 36, playColor);
-		
-		// 1: DISPLAY
-		Color screenColor = (menuSelection == 1) ? activeCol : idleCol;
-		DrawText(screenText, curW / 2 - screenWidth / 2, screenY, 36, screenColor);
-		if (menuSelection == 1) DrawText(">", curW / 2 - screenWidth / 2 - 35, screenY, 36, screenColor);
-		
-		// 2: EXIT
-		Color exitColor = (menuSelection == 2) ? activeCol : idleCol;
-		DrawText(exitText, curW / 2 - exitWidth / 2, exitY, 36, exitColor);
-		if (menuSelection == 2) DrawText(">", curW / 2 - exitWidth / 2 - 35, exitY, 36, exitColor);
-		
-		// Подсказка внизу
-		const char* hint = "W / S - NAVIGATE   |   ENTER - SELECT";
-		int hintWidth = MeasureText(hint, 15);
-		DrawText(hint, curW / 2 - hintWidth / 2, curH - 50, 15, (Color){60, 60, 60, 255});
-	}
-	
-	
+// Dusty stone, warm copper and cold teal: inspired by the map's brick/metal palette.
+static const Color uiSand={225,210,173,255};
+static const Color uiCopper={194,146,88,255};
+static const Color uiTeal={116,178,170,255};
+static const Color uiDark={22,28,30,250};
 
-// ------------------------------------------------------------
-//  GLSL ШЕЙДЕР
-// ------------------------------------------------------------
+static void DrawTacticalFrame(int x,int y,int w,int h,const char *kicker) {
+    DrawRectangle(x+7,y+8,w,h,(Color){7,10,10,210});
+    DrawRectangle(x,y,w,h,uiDark);
+    DrawRectangle(x+7,y+7,w-14,h-14,(Color){35,41,40,250});
+    DrawRectangle(x+13,y+13,w-26,h-26,(Color){29,35,35,250});
+    DrawRectangle(x,y,w,7,(Color){124,102,72,255});
+    DrawRectangle(x,y+7,w,3,(Color){76,83,79,255});
+    DrawRectangleLinesEx((Rectangle){(float)x,(float)y,(float)w,(float)h},2,uiCopper);
+    for(int i=0;i<4;++i){
+        int px=x+(i%2?w-15:15),py=y+(i/2?h-15:15);
+        DrawCircle(px,py,3,(Color){117,110,94,255});
+        DrawLine(px-2,py+1,px+2,py-1,(Color){40,39,34,255});
+    }
+    // Non-animated fixed grime and relief to match the environment.
+    for(int i=0;i<62;++i) {
+        unsigned int r=hash2((unsigned int)(i+47),(unsigned int)(w+h));
+        int px=x+17+(int)(r%(unsigned int)(w-34));
+        int py=y+18+(int)((r>>16)%(unsigned int)(h-36));
+        DrawPixel(px,py,(Color){93,84,66,45});
+    }
+    if(kicker && kicker[0])DrawText(kicker,x+27,y+18,13,uiTeal);
+}
+
+static void DrawSectionSeparator(int x,int y,int w){
+    DrawRectangle(x,y,w,2,(Color){111,95,71,255});
+    DrawRectangle(x,y+3,w,1,(Color){53,69,70,255});
+}
+
+void DrawMainMenu(void) {
+    int curW=GetScreenWidth(),curH=GetScreenHeight();
+    ClearBackground((Color){22,28,27,255});
+    int w=600,h=510,x=(curW-w)/2,y=(curH-h)/2;
+    DrawTacticalFrame(x,y,w,h,"SURVIVAL // LAN ARENA");
+    DrawText("BATTLE SIMULATION",x+46,y+65,36,uiSand);
+    DrawText("IN HARD TIMES",x+49,y+113,19,uiCopper);
+    DrawSectionSeparator(x+42,y+148,w-84);
+    const char* opts[4]={"START GAME",isFullscreen?"DISPLAY: FULLSCREEN":"DISPLAY: WINDOWED","MOUSE SETTINGS","EXIT GAME"};
+    for(int i=0;i<4;++i){
+        int yy=y+168+i*66;
+        bool selected=i==menuSelection;
+        DrawRectangle(x+43,yy,w-86,52,selected?(Color){73,83,69,255}:(Color){43,51,48,255});
+        DrawRectangle(x+43,yy,selected?5:2,52,selected?uiCopper:(Color){90,99,93,255});
+        DrawText(opts[i],x+68,yy+14,23,selected?uiSand:(Color){168,168,148,255});
+        if(selected)DrawText(">",x+w-86,yy+13,22,uiCopper);
+        Rectangle hit={(float)(x+43),(float)yy,(float)(w-86),52.0f};
+        if(currentState==STATE_MENU && !showSettingsMenu &&
+           CheckCollisionPointRec(GetMousePosition(),hit) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            menuSelection=i;
+            if(i==0) {menuSelection=0;currentState=STATE_LOBBY;}
+            else if(i==1)ToggleScreenMode();
+            else if(i==2)showSettingsMenu=true;
+            else quitRequested=true;
+        }
+    }
+    DrawText("W/S  SELECT     ENTER  CONFIRM / CLICK",x+45,y+h-34,17,uiTeal);
+}
 
 // Screen-space HUD helpers: raycaster world stays separate from game UI.
 static bool DrawMenuButton(Rectangle rect, const char *caption, Color hoverColor) {
     bool hover=CheckCollisionPointRec(GetMousePosition(),rect);
-    DrawRectangleRec(rect,hover?hoverColor:(Color){34,44,57,245});
-    DrawRectangleLinesEx(rect,2,(Color){118,144,169,255});
+    Color fill=hover?hoverColor:(Color){64,75,69,255};
+    DrawRectangleRec(rect,fill);
+    DrawRectangle((int)rect.x,(int)rect.y,5,(int)rect.height,hover?uiSand:uiCopper);
+    DrawRectangleLinesEx(rect,2,hover?uiSand:(Color){126,119,99,255});
     int fs=18;
     DrawText(caption,(int)(rect.x+(rect.width-MeasureText(caption,fs))*0.5f),
-             (int)(rect.y+(rect.height-fs)*0.5f),fs,RAYWHITE);
+             (int)(rect.y+(rect.height-fs)*0.5f),fs,uiSand);
     return hover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+}
+
+static int activeSettingSlider=-1;
+static float DrawTacticalSlider(int id,int x,int y,int w,const char* label,float val,float low,float high) {
+    Rectangle hit={(float)x,(float)(y+32),(float)w,32.0f};
+    Vector2 mp=GetMousePosition();
+    if(IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mp,hit))activeSettingSlider=id;
+    if(!IsMouseButtonDown(MOUSE_BUTTON_LEFT) && activeSettingSlider==id){activeSettingSlider=-1;SaveControls();}
+    if(activeSettingSlider==id && IsMouseButtonDown(MOUSE_BUTTON_LEFT)){
+        val=low+(high-low)*fmaxf(0.0f,fminf(1.0f,(mp.x-x)/w));
+    }
+    float t=(val-low)/(high-low);
+    DrawText(label,x,y,18,uiSand);
+    DrawRectangle(x,y+39,w,9,(Color){62,64,57,255});
+    DrawRectangle(x,y+39,(int)(w*t),9,uiTeal);
+    DrawRectangle(x+(int)(w*t)-6,y+32,12,24,uiCopper);
+    DrawRectangleLinesEx((Rectangle){(float)x,(float)(y+39),(float)w,9},1,(Color){123,118,95,255});
+    return val;
+}
+
+static void DrawSettingsPanel(int curW,int curH) {
+    DrawRectangle(0,0,curW,curH,Fade(BLACK,0.64f));
+    int w=600,h=398,x=curW/2-w/2,y=curH/2-h/2;
+    DrawTacticalFrame(x,y,w,h,"INPUT CONFIGURATION // CS-STYLE");
+    DrawText("MOUSE SETTINGS",x+35,y+54,28,uiSand);
+    DrawSectionSeparator(x+32,y+101,w-64);
+    mouseSensitivity=DrawTacticalSlider(0,x+38,y+121,w-76,"SENSITIVITY",mouseSensitivity,0.1f,5.0f);
+    DrawText(TextFormat("%.2f",mouseSensitivity),x+w-116,y+120,18,uiCopper);
+    float newDpi=DrawTacticalSlider(1,x+38,y+205,w-76,"VIRTUAL DPI / AIM MULTIPLIER",(float)virtualMouseDPI,400.0f,3200.0f);
+    virtualMouseDPI=(int)(roundf(newDpi/100.0f)*100);
+    DrawText(TextFormat("%d",virtualMouseDPI),x+w-116,y+204,18,uiCopper);
+    DrawText("Affects game aim only, not your mouse hardware DPI.",x+37,y+288,15,(Color){166,173,156,255});
+    Rectangle back={(float)(x+171),(float)(y+h-70),258,44};
+    if(DrawMenuButton(back,"SAVE & BACK",(Color){95,113,84,255})) {
+        showSettingsMenu=false;activeSettingSlider=-1;
+        SaveControls();
+        if(currentState==STATE_PLAYING && !showPauseMenu && !showTabMenu)
+            {blockFireUntilRelease=true;DisableCursor();}
+    }
+}
+
+static void DrawPausePanel(int curW,int curH) {
+    DrawRectangle(0,0,curW,curH,Fade(BLACK,0.54f));
+    int w=510,h=420,x=curW/2-w/2,y=curH/2-h/2;
+    DrawTacticalFrame(x,y,w,h,"GAME PAUSED // ESC");
+    DrawText("PAUSE MENU",x+35,y+55,33,uiSand);
+    DrawSectionSeparator(x+33,y+109,w-66);
+    Rectangle resume={(float)x+50,(float)y+134,(float)w-100,50};
+    Rectangle settings={(float)x+50,(float)y+196,(float)w-100,50};
+    Rectangle menu={(float)x+50,(float)y+258,(float)w-100,50};
+    Rectangle leave={(float)x+50,(float)y+320,(float)w-100,50};
+    if(DrawMenuButton(resume,"RESUME",(Color){83,114,98,255})){
+        showPauseMenu=false;blockFireUntilRelease=true;DisableCursor();
+    }
+    if(DrawMenuButton(settings,"MOUSE SETTINGS",(Color){91,108,96,255}))showSettingsMenu=true;
+    if(DrawMenuButton(menu,"MAIN MENU",(Color){104,97,77,255}))ReturnToMainMenu();
+    if(DrawMenuButton(leave,"EXIT GAME",(Color){133,78,67,255})){
+        LeaveServer();quitRequested=true;
+    }
 }
 
 static void DrawPlayerHealth(int curW,int curH) {
     if(myPlayerID<0 || myPlayerID>=MAX_NET_PLAYERS) return;
     int health=netPlayers[myPlayerID].health;
-    if(health<0) health=0; if(health>100) health=100;
+    if(health<0) health=0;
+    if(health>100) health=100;
     int w=235,h=17,x=24,y=curH-62;
+    (void)curW;
     DrawRectangle(x-4,y-4,w+8,h+8,(Color){9,16,24,213});
     DrawRectangle(x,y,w,h,(Color){44,48,56,240});
     Color fill=(health>60)?(Color){61,206,139,255}:(health>25)?(Color){240,183,71,255}:(Color){226,70,71,255};
@@ -3055,7 +3167,7 @@ static void DrawKillsFeed(int curW) {
 static void DrawKeyHints(void) {
     if(!showKeyHints)return;
     int x=18,y=18;
-    const char *lines[]={"W A S D   MOVE","SHIFT     SPRINT","SPACE     JUMP","R         RELOAD","TAB       PLAYERS","T         CHAT","5         HIDE HINTS","M         MAP"};
+    const char *lines[]={"W A S D   MOVE","SHIFT     SPRINT","SPACE     JUMP","R         RELOAD","TAB       PLAYERS","T         CHAT","5         HIDE HINTS","ESC       PAUSE"};
     DrawRectangle(x-8,y-9,225,246,Fade((Color){12,19,27,255},0.77f));
     DrawRectangleLines(x-8,y-9,225,246,(Color){100,131,148,225});
     DrawText("CONTROLS",x+3,y,18,(Color){155,215,248,255});
@@ -3063,39 +3175,41 @@ static void DrawKeyHints(void) {
 }
 
 static void DrawScoreboard(int curW,int curH) {
-    const int w=580,h=498;
+    int count=0;
+    for(int i=0;i<MAX_NET_PLAYERS;++i)if(netActive[i])count++;
+    const int w=640,h=235+(count>0?count:1)*35;
     int x=curW/2-w/2,y=curH/2-h/2;
-    DrawRectangle(0,0,curW,curH,Fade(BLACK,0.38f));
-    DrawRectangle(x,y,w,h,(Color){12,23,34,248});
-    DrawRectangleLinesEx((Rectangle){(float)x,(float)y,(float)w,(float)h},2,(Color){100,171,194,255});
-    int count=0;for(int i=0;i<MAX_NET_PLAYERS;++i)if(netActive[i])count++;
-    DrawText(TextFormat("SERVER #%d",currentServerNumber),x+24,y+22,28,(Color){163,218,249,255});
-    DrawText(TextFormat("PLAYERS  %d / 8",count),x+w-195,y+28,19,RAYWHITE);
-    if(isServer)DrawText(TextFormat("HOST: %s",myLocalIP),x+24,y+60,16,(Color){171,187,204,255});
-    DrawRectangle(x+18,y+92,w-36,32,(Color){36,61,77,255});
-    DrawText("PLAYER",x+32,y+100,17,RAYWHITE);
-    DrawText("K",x+307,y+100,17,RAYWHITE);
-    DrawText("D",x+379,y+100,17,RAYWHITE);
-    DrawText("KD%",x+448,y+100,17,RAYWHITE);
-    for(int i=0;i<MAX_NET_PLAYERS;++i) {
-        int yy=y+132+i*30;
-        if(i%2==0) DrawRectangle(x+18,yy-3,w-36,29,(Color){23,40,53,255});
-        Color co=netActive[i]?(i==myPlayerID?(Color){143,238,186,255}:RAYWHITE):(Color){102,118,132,255};
-        DrawText(TextFormat("Player %d%s",i+1,i==myPlayerID?"  (YOU)":""),x+32,yy+2,18,co);
-        if(netActive[i]) {
-            int k=netPlayers[i].kills,d=netPlayers[i].deaths;
-            int kd=(k+d>0)?(int)(100.0f*k/(k+d)+0.5f):0;
-            DrawText(TextFormat("%d",k),x+303,yy+2,18,co);
-            DrawText(TextFormat("%d",d),x+376,yy+2,18,co);
-            DrawText(TextFormat("%d%%",kd),x+443,yy+2,18,co);
-        } else DrawText("--          --         --",x+303,yy+2,17,co);
+    DrawRectangle(0,0,curW,curH,Fade(BLACK,0.55f));
+    DrawTacticalFrame(x,y,w,h,"MULTIPLAYER // TAB");
+    DrawText(TextFormat("SERVER #%d",currentServerNumber),x+32,y+52,29,uiSand);
+    DrawText(TextFormat("ONLINE: %d / 8",count),x+w-194,y+58,18,uiTeal);
+    if(isServer)DrawText(TextFormat("HOST: %s",myLocalIP),x+34,y+92,16,uiCopper);
+    DrawSectionSeparator(x+28,y+121,w-56);
+    DrawText("PLAYER",x+42,y+137,16,uiCopper);
+    DrawText("K",x+386,y+137,16,uiCopper);
+    DrawText("D",x+451,y+137,16,uiCopper);
+    DrawText("KD%",x+526,y+137,16,uiCopper);
+    int visibleRow=0;
+    for(int i=0;i<MAX_NET_PLAYERS;++i){
+        if(!netActive[i])continue; // empty slots stay completely invisible
+        int yy=y+164+visibleRow*35;
+        DrawRectangle(x+29,yy-6,w-58,32,visibleRow%2?(Color){44,51,48,255}:(Color){53,62,54,255});
+        Color fg=(i==myPlayerID)?(Color){166,228,177,255}:uiSand;
+        DrawText(TextFormat("%02d   Player %d%s",i+1,i+1,i==myPlayerID?"  [YOU]":""),x+43,yy,18,fg);
+        int k=netPlayers[i].kills,d=netPlayers[i].deaths;
+        int kd=(k+d>0)?(int)(100.0f*k/(k+d)+0.5f):0;
+        DrawText(TextFormat("%d",k),x+383,yy,18,fg);
+        DrawText(TextFormat("%d",d),x+447,yy,18,fg);
+        DrawText(TextFormat("%d%%",kd),x+519,yy,18,fg);
+        visibleRow++;
     }
-    Rectangle menuBtn={(float)(x+25),(float)(y+h-72),245,48};
-    Rectangle exitBtn={(float)(x+310),(float)(y+h-72),245,48};
-    bool goMenu=DrawMenuButton(menuBtn,"MAIN MENU",(Color){36,99,111,255});
-    bool exitGame=DrawMenuButton(exitBtn,"EXIT GAME",(Color){145,49,48,255});
-    if(goMenu)ReturnToMainMenu();
-    if(exitGame) {LeaveServer();quitRequested=true;}
+    if(count==0)DrawText("WAITING FOR PLAYERS...",x+44,y+170,17,uiSand);
+    Rectangle menuBtn={(float)(x+34),(float)(y+h-63),260,43};
+    Rectangle exitBtn={(float)(x+346),(float)(y+h-63),260,43};
+    if(DrawMenuButton(menuBtn,"MAIN MENU",(Color){94,102,79,255}))ReturnToMainMenu();
+    if(DrawMenuButton(exitBtn,"EXIT GAME",(Color){133,77,65,255})){
+        LeaveServer();quitRequested=true;
+    }
 }
 
 static void DrawDeathScreen(int curW,int curH) {
@@ -3196,6 +3310,7 @@ static const char *ps2FragmentShader =
 	SetExitKey(KEY_NULL);
     InitAudioDevice();
     InitChatFont();
+    LoadControls();
 	GenerateAllTextures();
 	GenerateTofuTextures();
 	GenMap();
@@ -3250,8 +3365,7 @@ static const char *ps2FragmentShader =
 	Color *pixels = (Color *)renderBuffer.data;
 	Texture2D screenTexture = LoadTextureFromImage(renderBuffer);
 	
-	RenderTexture2D minimapRT = LoadRenderTexture(200, 200);
-	int minimapTick = 0;
+	// Minimap disabled; no minimap render texture is allocated.
 	
 	RenderTexture2D postRT = LoadRenderTexture(SW, SH);
 	Shader ps2Shader = LoadShaderFromMemory(NULL, ps2FragmentShader);
@@ -3279,28 +3393,30 @@ static const char *ps2FragmentShader =
 	    if(dt>0.05f)dt=0.05f;
     if(dt<0.00001f)dt=0.00001f;
 		
-		if (hasMusic) UpdateMusicStream(music);
+        if (hasMusic) UpdateMusicStream(music);
+        if(quitRequested)break;
 		
 		// ============================================================
 		// 1. ЛОГИКА (МЕНЮ, ЛОББИ, СПИСОК СЕРВЕРОВ, ИГРА)
 		// ============================================================
 		if (currentState == STATE_MENU) {
-			if (IsKeyPressed(KEY_W) || IsKeyPressed(KEY_UP)) menuSelection--;
-			if (IsKeyPressed(KEY_S) || IsKeyPressed(KEY_DOWN)) menuSelection++;
-			if (menuSelection < 0) menuSelection = 2;
-			if (menuSelection > 2) menuSelection = 0;
-			
-			if (IsKeyPressed(KEY_ENTER)) {
-				if (menuSelection == 0) {
-					menuSelection = 0;
-					currentState = STATE_LOBBY;
-				} else if (menuSelection == 1) {
-					ToggleScreenMode();
-				} else if (menuSelection == 2) {
-					break;
-				}
-			}
-		}
+            if(showSettingsMenu) {
+                if(IsKeyPressed(KEY_ESCAPE)) {showSettingsMenu=false;SaveControls();}
+            } else {
+                if(IsKeyPressed(KEY_W)||IsKeyPressed(KEY_UP))menuSelection--;
+                if(IsKeyPressed(KEY_S)||IsKeyPressed(KEY_DOWN))menuSelection++;
+                if(menuSelection<0)menuSelection=3;
+                if(menuSelection>3)menuSelection=0;
+                if(IsKeyPressed(KEY_ENTER)) {
+                    switch(menuSelection){
+                        case 0:menuSelection=0;currentState=STATE_LOBBY;break;
+                        case 1:ToggleScreenMode();break;
+                        case 2:showSettingsMenu=true;EnableCursor();break;
+                        case 3:quitRequested=true;break;
+                    }
+                }
+            }
+        }
 		else if (currentState == STATE_LOBBY) {
 			if (IsKeyPressed(KEY_W) || IsKeyPressed(KEY_UP)) menuSelection--;
 			if (IsKeyPressed(KEY_S) || IsKeyPressed(KEY_DOWN)) menuSelection++;
@@ -3421,12 +3537,21 @@ static const char *ps2FragmentShader =
 			}
 			
             if(IsKeyPressed(KEY_FIVE)) showKeyHints=!showKeyHints;
-            if(IsKeyPressed(KEY_TAB) && !showChatInput) {
-                showTabMenu=!showTabMenu;
-                if(showTabMenu || (myPlayerID>=0 && netPlayers[myPlayerID].isDead)) EnableCursor();
+            if(IsKeyPressed(KEY_ESCAPE) && !showChatInput) {
+                if(showSettingsMenu) {showSettingsMenu=false;SaveControls();}
+                else if(showTabMenu) {showTabMenu=false;showPauseMenu=true;}
+                else showPauseMenu=!showPauseMenu;
+                blockFireUntilRelease=true;
+                if(showPauseMenu || showTabMenu || showSettingsMenu || netPlayers[myPlayerID>=0?myPlayerID:0].isDead)EnableCursor();
                 else DisableCursor();
             }
-            if(IsKeyPressed(KEY_T) && !showChatInput && !showTabMenu && myPlayerID>=0 && !netPlayers[myPlayerID].isDead) {
+            if(IsKeyPressed(KEY_TAB) && !showChatInput && !showSettingsMenu && !showPauseMenu) {
+                showTabMenu=!showTabMenu;
+                blockFireUntilRelease=true;
+                if(showTabMenu || (myPlayerID>=0 && netPlayers[myPlayerID].isDead))EnableCursor();
+                else DisableCursor();
+            }
+            if(IsKeyPressed(KEY_T) && !showChatInput && !showTabMenu && !showPauseMenu && !showSettingsMenu && myPlayerID>=0 && !netPlayers[myPlayerID].isDead) {
                 showChatInput=true;
                 chatInput[0]='\0';
                 // Drain the T character that opened the chat.
@@ -3460,7 +3585,7 @@ static const char *ps2FragmentShader =
                 }
             }
             if(myPlayerID>=0 && myPlayerID<MAX_NET_PLAYERS) {
-                if(!netPlayers[myPlayerID].isDead && !showTabMenu && !showChatInput) {
+                if(!netPlayers[myPlayerID].isDead && !showTabMenu && !showPauseMenu && !showSettingsMenu && !showChatInput) {
                     UpdatePlayer(dt);
                 }
                 netPlayers[myPlayerID].x=player.x;
@@ -3470,6 +3595,7 @@ static const char *ps2FragmentShader =
                 SendMyState(netPlayers[myPlayerID]);
             }
             deathFlash=fmaxf(0.0f,deathFlash-dt*0.9f);
+            if(quitRequested)break;
 
 			if (volume_ui_timer > 0.0f) volume_ui_timer -= dt;
 			if (stamina_ui_timer > 0.0f) stamina_ui_timer -= dt;
@@ -3489,7 +3615,6 @@ static const char *ps2FragmentShader =
 			RenderFrame(pixels);
 			UpdateTexture(screenTexture, pixels);
 			
-			if (showMap && (++minimapTick >= 10)) { minimapTick = 0; DrawMiniMap(minimapRT); }
 			
 			BeginTextureMode(postRT);
 			ClearBackground(BLACK);
@@ -3525,9 +3650,11 @@ static const char *ps2FragmentShader =
 		ClearBackground(BLACK);
 		
 		// 1. Главное меню
-		if (currentState == STATE_MENU || (currentState == STATE_TRANSITION && fadeToWhite)) {
-			DrawMainMenu();
-		} 
+        if (currentState == STATE_MENU || (currentState == STATE_TRANSITION && fadeToWhite)) {
+            DrawMainMenu();
+            if(currentState==STATE_MENU && showSettingsMenu)
+                DrawSettingsPanel(GetScreenWidth(),GetScreenHeight());
+        } 
 		// 2. Экран выбора: Создать или Найти сервер
 		else if (currentState == STATE_LOBBY) {
 			int curW = GetScreenWidth();
@@ -3714,7 +3841,7 @@ static const char *ps2FragmentShader =
 				}
 				
 				// --- ПРИЦЕЛ ---
-				if (!showTabMenu && (myPlayerID<0 || !netPlayers[myPlayerID].isDead)) {
+				if (!showTabMenu && !showPauseMenu && !showSettingsMenu && (myPlayerID<0 || !netPlayers[myPlayerID].isDead)) {
 					float scaleX = (float)curW / (float)SW;
 					float scaleY = (float)curH / (float)SH;
 					int cx = curW / 2 + (int)(player.crosshairX * scaleX);
@@ -3731,16 +3858,13 @@ static const char *ps2FragmentShader =
 				
                 DrawPlayerHealth(curW,curH);
                 DrawKillsFeed(curW);
-                if(!showTabMenu) {
+                if(!showTabMenu && !showPauseMenu && !showSettingsMenu){
                     DrawKeyHints();
-                    if(showMap) {
-                        DrawTexturePro(minimapRT.texture,
-                            (Rectangle){0,0,200,-200},(Rectangle){16,showKeyHints?270:26,180,180},
-                            (Vector2){0,0},0.0f,WHITE);
-                    }
                     DrawGameChat(curH);
                 }
                 if(showTabMenu) DrawScoreboard(curW,curH);
+                if(showPauseMenu) DrawPausePanel(curW,curH);
+                if(showSettingsMenu) DrawSettingsPanel(curW,curH);
                 if(myPlayerID>=0 && netPlayers[myPlayerID].isDead) DrawDeathScreen(curW,curH);
 
 			}
@@ -3779,13 +3903,13 @@ static const char *ps2FragmentShader =
     if (pistol.sndReloadEnd.frameCount > 0) UnloadSound(pistol.sndReloadEnd);
     if (pistol.sndEmpty.frameCount > 0) UnloadSound(pistol.sndEmpty);
     if (customChatFont) UnloadFont(chatFont);
+    SaveControls();
 	if (udpSocket != INVALID_SOCKET) closesocket(udpSocket);
 	WSACleanup();
 	
 	UnloadShader(ps2Shader);
 	UnloadRenderTexture(postRT);
 	if (hasMusic) UnloadMusicStream(music);
-	UnloadRenderTexture(minimapRT);
 	UnloadTexture(screenTexture); 
 	UnloadImage(renderBuffer);
 	CloseAudioDevice(); 
