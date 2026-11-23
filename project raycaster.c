@@ -52,7 +52,7 @@ int cpu_threads = 4;
 
 // Игрок
 #define PLAYER_RADIUS 0.4f
-#define EYE_HEIGHT    0.55f
+#define EYE_HEIGHT    1.0f
 #define PLAYER_HEIGHT 1.30f // taller remote player models
 
 // Физика
@@ -287,8 +287,8 @@ bool deathAnimPending[MAX_NET_PLAYERS];
 float respawnTimer = 0.0f;
 float deathFlash = 0.0f;
 
-// Pictures: drop 1.png ... 8.png (or .jpg) into posters/ and restart.
-#define MAX_POSTERS 8
+// Pictures: drop 1.png ... 16.png (or .jpg) into posters/ and restart.
+#define MAX_POSTERS 16
 #define POSTER_RES 96
 static Color posterData[MAX_POSTERS][POSTER_RES][POSTER_RES];
 static bool posterLoaded[MAX_POSTERS];
